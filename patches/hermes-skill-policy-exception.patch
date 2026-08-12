@@ -1,0 +1,16 @@
+diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
+--- a/agent/prompt_builder.py
++++ b/agent/prompt_builder.py
+@@ -1595,7 +1595,11 @@ def build_skills_system_prompt(
+             "Before replying, scan the skills below. If a skill matches or is even partially relevant "
+             "to your task, you MUST load it with skill_view(name) and follow its instructions. "
+             "Err on the side of loading — it is always better to have context you don't need "
+-            "than to miss critical steps, pitfalls, or established workflows. "
++            "than to miss critical steps, pitfalls, or established workflows. The exception is a "
++            "platform-injected trusted access policy for the current turn that explicitly says skill "
++            "tools are unavailable. In that case, do not attempt skill_view or another denied tool as "
++            "a workaround; proceed directly with the tools that policy allows. This exception never "
++            "makes a denied tool available. "
+             "Skills contain specialized knowledge — API endpoints, tool-specific commands, "
+             "and proven workflows that outperform general-purpose approaches. Load the skill "
+             "even if you think you could handle the task with basic tools like web_search or terminal. "

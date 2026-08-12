@@ -1,0 +1,60 @@
+# Non-secret Hermes behavior settings. Install as /root/.hermes/config.yaml.
+# One conversation is shared by all participants in the same channel.  The
+# deployed guild-isolation patch still keeps different Discord servers apart.
+group_sessions_per_user: false
+
+web:
+  # Free, no-key search backend. This provides web_search only; configure a
+  # separate extract backend before advertising web_extract as available.
+  search_backend: ddgs
+
+discord:
+  # Every production server must be explicitly listed. Quote IDs so YAML
+  # parsers never treat them as numbers.
+  allowed_guilds:
+    - "1146359014968537089"
+    - "921407984586866778"
+  # An empty list means no channel restriction. Replace this placeholder with
+  # each channel that should be allowed before using the example in production.
+  allowed_channels:
+    - "921407984586866781" # 秘密研究 / 常规
+    - "1154706638901612625" # Bird Gaming administrator channel
+    - "1220876330913234944" # 秘密研究 administrator channel
+  require_mention: true
+  thread_require_mention: true
+  # Shared-channel conversation is the normal ChatBird UX; do not create a
+  # separate Discord thread for every mention.
+  auto_thread: false
+  history_backfill: true
+  # Keep this bounded on the small production server.
+  history_backfill_limit: 50
+  allow_mentions:
+    everyone: false
+    roles: false
+    users: true
+    replied_user: false
+
+memory:
+  # MEMORY.md is scoped by Discord guild ID by the ChatBird Hermes patch.
+  memory_enabled: true
+  # A shared USER.md would mix multiple members in one guild, so leave it off.
+  user_profile_enabled: false
+
+# Adapter-specific options live in the platform extra block in Hermes 0.17.
+platforms:
+  discord:
+    extra:
+      # Public users interact through normal @mentions. Disable Discord slash
+      # commands so /update, /restart, /memory, etc. cannot bypass the
+      # request-scoped ChatBird tool policy.
+      slash_commands: false
+      # Keep unknown file types blocked. Enabling this may send uploaded file
+      # contents to the configured model provider and needs an explicit policy.
+      allow_any_attachment: false
+      # Each accepted attachment is briefly held in memory. Never set this to 0
+      # (unlimited) on the production host.
+      max_attachment_bytes: 33554432
+
+plugins:
+  enabled:
+    - chatbird-policy

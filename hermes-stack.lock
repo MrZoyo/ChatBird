@@ -7,4 +7,6 @@ patch patches/hermes-discord-public-access-dm-log.patch
 patch patches/hermes-chatbird-home-notice.patch
 patch patches/hermes-chatbird-slash-policy.patch
 patch patches/hermes-discord-category-channel-allowlist.patch
+patch patches/hermes-skill-policy-exception.patch
 overlay patches/hermes-tests/test_discord_chatbird_access.py tests/plugins/test_discord_chatbird_access.py
+overlay patches/hermes-tests/test_chatbird_skill_policy_exception.py tests/agent/test_chatbird_skill_policy_exception.py

@@ -25,3 +25,7 @@ The production checkout remains a normal Hermes Git worktree. When upgrading
 Hermes, update the base commit, refresh patches as needed, rebuild in a
 temporary worktree, run the targeted tests, and compare the rebuilt files with
 the intended production files before deployment.
+
+ChatBird uses `main` as its only long-lived integration branch. Once a feature
+branch is merged, keep the patch stack and documentation on `main` and delete
+the obsolete branch.

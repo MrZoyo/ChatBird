@@ -6,6 +6,10 @@ model:
 # every Guild in a separate session and memory namespace.
 group_sessions_per_user: false
 
+web:
+  # No-key DuckDuckGo search. URL extraction requires a separate backend.
+  search_backend: ddgs
+
 discord:
   require_mention: true
   thread_require_mention: true

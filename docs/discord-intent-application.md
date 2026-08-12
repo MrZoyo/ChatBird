@@ -6,13 +6,17 @@ application for ChatBird.
 ## App Description
 
 ChatBird is a Discord chat assistant based on Hermes Agent. The bot is also
-known as 小鸟聊天助手 or 乌鸦. It runs in our private Discord server and helps
-users with question answering, translation, information lookup, channel message
-summaries, and explanations of another server bot called Bird-Bot.
+known as 小鸟聊天助手 or 乌鸦. It runs only in servers approved by the operator
+and helps users with question answering, translation, information lookup,
+channel message summaries, and explanations of server tools such as Bird-Bot.
 
 ChatBird does not proactively speak. It is configured to respond only when a
 user explicitly mentions or replies to the bot, and only in allowed channels.
 Responses are generated through Hermes Agent using Xiaomi MiMo API.
+
+Only members of operator-approved Discord servers and channels can use the bot.
+Direct messages are not answered and are not sent to Hermes Agent; their text
+and attachment metadata are retained in a private security and debugging log.
 
 ## Public Privacy Policy
 
@@ -20,11 +24,15 @@ Privacy policy URL: `https://github.com/MrZoyo/ChatBird/blob/main/PRIVACY.md`
 
 Summary:
 
-ChatBird only processes messages when users mention or reply to the bot in
-allowed channels. Message content may be sent to Xiaomi MiMo API to generate
-responses and may be temporarily stored on our private server for conversation
-context, debugging, access control, and service operation. Data is not sold, not
-used for advertising, and not used to train our own machine learning models.
+ChatBird only begins responding when users mention or reply to the bot in
+allowed channels. A request such as a channel summary may include relevant
+recent messages from other users. Message content and supported attachments may
+be sent to Xiaomi MiMo API to generate responses and may be stored on our
+private server for conversation context, per-server long-term memory,
+debugging, access control, and service operation. Sessions and memory are
+isolated by Discord guild ID. Data is not sold, not used for advertising, and
+not used to train our own machine learning models. Direct messages are logged
+but not sent to the response model, and their attachments are not downloaded.
 
 ## Requested Intents
 
@@ -67,9 +75,10 @@ Answer: Yes.
 
 Explanation:
 
-We may temporarily store user IDs, role IDs, channel IDs, message IDs, and
-conversation metadata on our private server for access control, debugging,
-session continuity, and bot operation. We do not sell this data or use it for
+We may store user IDs, role IDs, channel IDs, message IDs, and conversation
+metadata on our private server for access control, debugging, session
+continuity, and bot operation. The bot is available to all members only within
+operator-approved servers and channels. We do not sell this data or use it for
 advertising. Access is limited to authorized server administrators.
 
 ## Message Content Intent
@@ -80,10 +89,15 @@ Answer: Yes.
 
 Explanation:
 
-Users can opt out by not mentioning or replying to ChatBird. The bot is
-configured to respond only when explicitly mentioned or replied to, and only in
-allowed channels. Users may also ask server administrators to restrict or remove
-bot access where practical.
+Users can avoid directly invoking ChatBird by not mentioning or replying to it.
+Relevant recent messages may still be processed when another user explicitly
+requests a channel summary. The bot is configured to respond only when invoked,
+and only in allowed servers and channels. Users may also ask server
+administrators to restrict or remove bot access where practical.
+
+Direct messages do not invoke the assistant and receive no response. Their text
+and attachment metadata are nevertheless recorded in a private operator log;
+direct-message attachments are not downloaded.
 
 ### External Storage
 
@@ -91,10 +105,17 @@ Answer: Yes.
 
 Explanation:
 
-Message content may be temporarily stored on our private server as Hermes Agent
-conversation context and logs for debugging, continuity, and abuse prevention.
-Message content may also be sent to Xiaomi MiMo API to generate replies. We do
-not sell message content and do not use it for advertising.
+Message content may be stored on our private server as Hermes Agent conversation
+context, per-server long-term memory, and logs for debugging, continuity, and
+abuse prevention. Message content and supported attachments may also be sent to
+Xiaomi MiMo API to generate replies. We do not sell message content and do not
+use it for advertising.
+
+Within an allowed server, users in the same channel share conversation history.
+Long-term memory is separated into server-wide memory, per-user profiles within
+that server, and restricted administrator memory. Direct-message logs have no
+fixed automatic deletion period, but do not enter agent context or long-term
+memory.
 
 ### Machine Learning or AI Training
 

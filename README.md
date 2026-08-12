@@ -6,6 +6,7 @@ ChatBird（小鸟聊天助手，昵称“乌鸦”）是一个面向 Discord 的
 会话隔离、持久记忆和生产运维进行了定制。
 
 当前生产模型为 `mimo-v2.5`，由 `hermes-gateway.service` 持续运行。
+网页搜索使用无需密钥的 DDGS 后端；网页正文提取需另行配置提取后端。
 
 ## 核心能力
 
@@ -60,11 +61,15 @@ NousResearch/hermes-agent @ locked base commit
   + Home Channel 提示控制
   + Slash Command 分级授权
   + Discord Category 白名单继承
+  + 公共频道 Skill 例外与直接网页搜索
   + ChatBird 定向测试覆盖
 ```
 
 具体基线和应用顺序以 [`hermes-stack.lock`](hermes-stack.lock) 为准。这样可以保留
 完整上游历史、明确审阅 ChatBird 的差异，并在升级 Hermes 时逐个处理冲突。
+
+`main` 是 ChatBird 唯一的长期集成分支。临时开发分支合并后即可删除；生产配置、
+补丁栈、策略插件、测试和运维文档都以 `main` 为准。
 
 ### 从锁定基线重建
 
@@ -116,6 +121,7 @@ DISCORD_AUTO_THREAD=false
 
 重要配置约束：
 
+- `web.search_backend: ddgs` 提供无需密钥的网页搜索，但不提供网页正文提取。
 - `discord.allowed_guilds` 必须列出每一个生产 Guild，未列入者默认拒绝。
 - `discord.allowed_channels` 可以列出具体频道或 Category ID；子频道继承 Category
   白名单。
