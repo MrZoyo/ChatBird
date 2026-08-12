@@ -1,0 +1,10 @@
+# Reproducible Hermes Agent integration stack for ChatBird.
+# Keep this file free of credentials; it is safe to commit.
+upstream_repo https://github.com/NousResearch/hermes-agent.git
+base_commit f53b184c48712bcbb98556a6314cd1f240fc104d
+patch patches/hermes-discord-guild-memory-isolation.patch
+patch patches/hermes-discord-public-access-dm-log.patch
+patch patches/hermes-chatbird-home-notice.patch
+patch patches/hermes-chatbird-slash-policy.patch
+patch patches/hermes-discord-category-channel-allowlist.patch
+overlay patches/hermes-tests/test_discord_chatbird_access.py tests/plugins/test_discord_chatbird_access.py
