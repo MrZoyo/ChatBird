@@ -1,0 +1,72 @@
+diff --git a/plugins/platforms/discord/adapter.py b/plugins/platforms/discord/adapter.py
+--- a/plugins/platforms/discord/adapter.py
++++ b/plugins/platforms/discord/adapter.py
+@@ -5370,11 +5370,10 @@ class DiscordAdapter(BasePlatformAdapter):
+         #   discord.auto_thread: Auto-create thread on @mention in channels (default: true)
+ 
+         thread_id = None
+-        parent_channel_id = None
++        parent_channel_id = self._get_parent_channel_id(message.channel)
+         is_thread = isinstance(message.channel, discord.Thread)
+         if is_thread:
+             thread_id = str(message.channel.id)
+-            parent_channel_id = self._get_parent_channel_id(message.channel)
+ 
+         is_voice_linked_channel = False
+ 
+diff --git a/tests/gateway/test_discord_channel_controls.py b/tests/gateway/test_discord_channel_controls.py
+--- a/tests/gateway/test_discord_channel_controls.py
++++ b/tests/gateway/test_discord_channel_controls.py
+@@ -56,10 +56,18 @@ class FakeDMChannel:
+ 
+ 
+ class FakeTextChannel:
+-    def __init__(self, channel_id: int = 1, name: str = "general", guild_name: str = "Hermes Server"):
++    def __init__(
++        self,
++        channel_id: int = 1,
++        name: str = "general",
++        guild_name: str = "Hermes Server",
++        parent=None,
++    ):
+         self.id = channel_id
+         self.name = name
+-        self.guild = SimpleNamespace(name=guild_name)
++        self.parent = parent
++        self.parent_id = getattr(parent, "id", None)
++        self.guild = getattr(parent, "guild", None) or SimpleNamespace(name=guild_name)
+         self.topic = None
+ 
+ 
+@@ -100,6 +108,31 @@ def make_message(*, channel, content: str, mentions=None):
+     )
+ 
+ 
++# ── allowed_channels ─────────────────────────────────────────────────
++
++
++@pytest.mark.asyncio
++async def test_allowed_category_processes_child_text_channel(adapter, monkeypatch):
++    """Text channels inherit allowed_channels membership from their category."""
++    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "500")
++    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
++    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
++    monkeypatch.setenv("DISCORD_HISTORY_BACKFILL", "false")
++    monkeypatch.delenv("DISCORD_IGNORED_CHANNELS", raising=False)
++    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
++
++    category = SimpleNamespace(id=500)
++    bot_user = adapter._client.user
++    message = make_message(
++        channel=FakeTextChannel(channel_id=501, parent=category),
++        content=f"<@{bot_user.id}> hello",
++        mentions=[bot_user],
++    )
++    await adapter._handle_message(message)
++
++    adapter.handle_message.assert_awaited_once()
++
++
+ # ── ignored_channels ─────────────────────────────────────────────────
+ 
+ 

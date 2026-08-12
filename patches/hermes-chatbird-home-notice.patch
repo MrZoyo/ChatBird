@@ -1,0 +1,70 @@
+diff --git a/gateway/run.py b/gateway/run.py
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -10073,7 +10073,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 context_prompt += _intro_note
+         
+         # One-time prompt if no home channel is set for this platform
+         # Skip for webhooks - they deliver directly to configured targets (github_comment, etc.)
+-        if not history and source.platform and source.platform != Platform.LOCAL and source.platform != Platform.WEBHOOK:
++        _suppress_home_notice = (
++            source.platform == Platform.DISCORD
++            and os.getenv("CHATBIRD_DISABLE_HOME_CHANNEL_NOTICE", "").strip().lower()
++            in {"true", "1", "yes"}
++        )
++        if not history and source.platform and source.platform != Platform.LOCAL and source.platform != Platform.WEBHOOK and not _suppress_home_notice:
+             platform_name = source.platform.value
+             env_key = _home_target_env_var(platform_name)
+             if not os.getenv(env_key):
+diff --git a/tests/gateway/test_status_command.py b/tests/gateway/test_status_command.py
+--- a/tests/gateway/test_status_command.py
++++ b/tests/gateway/test_status_command.py
+@@ -476,6 +476,48 @@ async def test_first_run_non_slack_home_channel_onboarding_keeps_direct_command(
+     assert "Type /sethome" in onboarding
+ 
+ 
++@pytest.mark.asyncio
++async def test_chatbird_can_suppress_discord_home_channel_onboarding(monkeypatch):
++    import gateway.run as gateway_run
++
++    session_entry = SessionEntry(
++        session_key=build_session_key(_make_source(Platform.DISCORD)),
++        session_id="sess-1",
++        created_at=datetime.now(),
++        updated_at=datetime.now(),
++        platform=Platform.DISCORD,
++        chat_type="group",
++    )
++    runner = _make_runner(session_entry, platform=Platform.DISCORD)
++    runner.session_store.load_transcript.return_value = []
++    runner.session_store.has_any_sessions.return_value = False
++    runner._run_agent = AsyncMock(
++        return_value={
++            "final_response": "ok",
++            "messages": [],
++            "tools": [],
++            "history_offset": 0,
++            "last_prompt_tokens": 0,
++            "input_tokens": 0,
++            "output_tokens": 0,
++            "model": "openai/test-model",
++        }
++    )
++
++    monkeypatch.delenv("DISCORD_HOME_CHANNEL", raising=False)
++    monkeypatch.setenv("CHATBIRD_DISABLE_HOME_CHANNEL_NOTICE", "true")
++    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
++    monkeypatch.setattr(
++        "agent.model_metadata.get_model_context_length",
++        lambda *_args, **_kwargs: 100000,
++    )
++
++    result = await runner._handle_message(_make_event("hello", platform=Platform.DISCORD))
++
++    assert result == "ok"
++    runner.adapters[Platform.DISCORD].send.assert_not_awaited()
++
++
+ @pytest.mark.asyncio
+ async def test_handle_message_discards_stale_result_after_session_invalidation(monkeypatch):
+     import gateway.run as gateway_run

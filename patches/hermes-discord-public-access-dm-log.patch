@@ -1,0 +1,95 @@
+diff --git a/plugins/platforms/discord/adapter.py b/plugins/platforms/discord/adapter.py
+--- a/plugins/platforms/discord/adapter.py
++++ b/plugins/platforms/discord/adapter.py
+@@ -1030,12 +1030,22 @@ class DiscordAdapter(BasePlatformAdapter):
+                     # "all" falls through; bot is permitted — skip the
+                     # human-user allowlist below (bots aren't in it).
+                 else:
++                    # ChatBird deliberately records DMs without dispatching
++                    # them to the agent.  This runs before the normal
++                    # allowlist so an unknown user cannot make an unlogged DM
++                    # disappear, while the early return guarantees that DMs
++                    # never receive a reply.
++                    _msg_guild = getattr(message, "guild", None)
++                    _is_dm = isinstance(message.channel, discord.DMChannel) or _msg_guild is None
++                    if _is_dm and os.getenv("CHATBIRD_DISABLE_DM_REPLIES", "true").lower() in {"true", "1", "yes"}:
++                        if os.getenv("CHATBIRD_LOG_DMS", "true").lower() in {"true", "1", "yes"}:
++                            await adapter_self._log_chatbird_dm(message)
++                        return
++
+                     # Non-bot: enforce the configured user/role allowlists.
+                     # Pass guild + is_dm so role checks are scoped to the
+                     # originating guild (prevents cross-guild DM bypass, see
+                     # _is_allowed_user docstring).
+-                    _msg_guild = getattr(message, "guild", None)
+-                    _is_dm = isinstance(message.channel, discord.DMChannel) or _msg_guild is None
+                     if not self._is_allowed_user(
+                         str(message.author.id),
+                         message.author,
+@@ -2762,6 +2772,10 @@ class DiscordAdapter(BasePlatformAdapter):
+         # (see AGENTS.md pitfall #17 — same pattern as gateway.run).
+         allowed_users = getattr(self, "_allowed_user_ids", set())
+         allowed_roles = getattr(self, "_allowed_role_ids", set())
++        if os.getenv("DISCORD_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
++            return True
++        if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
++            return True
+         has_users = bool(allowed_users)
+         has_roles = bool(allowed_roles)
+         if not has_users and not has_roles:
+@@ -2815,4 +2829,55 @@ class DiscordAdapter(BasePlatformAdapter):
+         m_roles = getattr(m, "roles", None) or []
+         return any(getattr(r, "id", None) in allowed_roles for r in m_roles)
+ 
++    async def _log_chatbird_dm(self, message: DiscordMessage) -> None:
++        """Append a bounded, mode-0600 DM record without invoking Hermes.
++
++        The log intentionally stores text and attachment metadata only; it
++        does not download arbitrary DM files.  The administrator can inspect
++        this file from the private admin channel with the normal admin tools.
++        """
++        try:
++            from hermes_constants import get_hermes_home
++
++            path = get_hermes_home() / "logs" / "chatbird-discord-dm.jsonl"
++        except Exception:
++            path = _Path.home() / ".hermes" / "logs" / "chatbird-discord-dm.jsonl"
++
++        entry = {
++            "timestamp": getattr(getattr(message, "created_at", None), "isoformat", lambda: "")(),
++            "message_id": str(getattr(message, "id", "") or ""),
++            "user_id": str(getattr(getattr(message, "author", None), "id", "") or ""),
++            "user_name": str(getattr(getattr(message, "author", None), "display_name", "") or ""),
++            "channel_id": str(getattr(getattr(message, "channel", None), "id", "") or ""),
++            "content": str(getattr(message, "content", "") or "")[:12000],
++            "attachments": [
++                {
++                    "id": str(getattr(att, "id", "") or ""),
++                    "filename": str(getattr(att, "filename", "") or "")[:240],
++                    "content_type": str(getattr(att, "content_type", "") or ""),
++                    "size": int(getattr(att, "size", 0) or 0),
++                }
++                for att in (getattr(message, "attachments", None) or [])
++            ],
++        }
++
++        def _append() -> None:
++            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
++            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
++            try:
++                with os.fdopen(fd, "a", encoding="utf-8") as stream:
++                    os.chmod(path, 0o600)
++                    stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
++            except Exception:
++                try:
++                    os.close(fd)
++                except OSError:
++                    pass
++                raise
++
++        try:
++            await asyncio.to_thread(_append)
++        except Exception:
++            logger.warning("[%s] Failed to record a Discord DM", self.name, exc_info=True)
++
+     # ── Slash command authorization ─────────────────────────────────────
