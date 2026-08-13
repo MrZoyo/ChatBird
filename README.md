@@ -133,6 +133,16 @@ DISCORD_AUTO_THREAD=false
   默认拒绝。
 - `DISCORD_AUTO_THREAD=false` 保持频道内联对话，不为每次提及创建新线程。
 
+### Category 白名单继承
+
+`discord.allowed_channels` 同时支持具体频道 ID 和 Category ID。普通 Guild 频道从
+discord.py 的 `category`/`category_id` 读取所属 Category；Thread 从
+`parent`/`parent_id` 读取父频道。普通消息和 Slash Command 共用这套继承规则。
+
+频道授权早于提及检查。如果频道及其 Category 都未匹配白名单，消息会被静默拒绝，
+即使用户已经正确 `@` Bot。排查“@Bot 无响应”时，应先确认频道对象的 Category
+已被正确解析。
+
 ## Discord 应用设置
 
 Discord Developer Portal 必须启用：
