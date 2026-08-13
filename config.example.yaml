@@ -4,9 +4,35 @@
 group_sessions_per_user: false
 
 web:
-  # Free, no-key search backend. This provides web_search only; configure a
-  # separate extract backend before advertising web_extract as available.
+  # Free, no-key search plus request-driven extraction. simple-http handles
+  # static HTML/text/JSON/XML and rejects private networks and oversized data.
   search_backend: ddgs
+  extract_backend: simple-http
+  # Keep browser automation internal to web_search/web_extract. The local
+  # Chromium fallback starts only after the primary provider fails and closes
+  # after one fixed DOM read; it is suitable for a small, low-traffic host.
+  browser_fallback:
+    enabled: true
+    search: true
+    extract: true
+    require_cloud: false
+    max_pages: 2
+    settle_seconds: 8
+    min_content_chars: 200
+    max_content_chars: 100000
+    # Optional final read-only fallback for sites that reject the local
+    # datacenter browser. Only exact hosts below are sent to Jina Reader.
+    reader_enabled: true
+    reader_allowed_hosts:
+      - www.vicioussyndicate.com
+    reader_timeout_seconds: 20
+
+# agent-browser 0.26.x and its Chromium runtime must be installed separately.
+# Local Chromium renders JavaScript but does not guarantee passage through
+# CAPTCHA, residential-IP, or advanced anti-bot challenges.
+browser:
+  cloud_provider: local
+  engine: chrome
 
 discord:
   # Every production server must be explicitly listed. Quote IDs so YAML

@@ -38,8 +38,8 @@ ChatBird 不绑定特定模型提供商、云平台或服务器。你可以按�
 | --- | --- |
 | 多 Guild 隔离 | 会话和持久记忆均包含 `guild_id`，防止跨服务器读取上下文 |
 | 默认拒绝的访问控制 | 仅接受 `allowed_guilds` 和 `allowed_channels` 明确允许的范围 |
-| Category 继承 | 文字频道继承所属 Category 的白名单；Thread 继承父频道 |
-| 明确触发 | 普通频道仅在用户 `@` Bot 或回复 Bot 时触发模型 |
+| Category 继承 | Guild 频道（含语音频道内置文字聊天）继承所属 Category 的白名单；Thread 继承父频道 |
+| 明确触发 | Guild 频道消息仅在用户 `@` Bot 或回复 Bot 时触发模型 |
 | 公开频道工具策略 | 普通用户只获得对话、受限网页查询、支持的附件分析和受限记忆能力 |
 | 管理员双重校验 | 敏感能力同时校验管理员用户和当前 `guild_id:channel_id` |
 | 私信隔离 | 私信不进入模型会话，也不获得 Bot 回复 |
@@ -140,8 +140,13 @@ discord:
   auto_thread: false
 ```
 
-普通文字频道通过 discord.py 的 `category`/`category_id` 读取所属 Category；Thread
-通过 `parent`/`parent_id` 读取父频道。普通消息和 Slash Command 使用相同的继承规则。
+普通文字频道和语音频道内置文字聊天通过 discord.py 的
+`category`/`category_id` 读取所属 Category；Thread 通过 `parent`/`parent_id`
+读取父频道。普通消息和 Slash Command 使用相同的继承规则。
+
+临时语音频道被删除时，适配器会取消该 channel ID 上正在运行、排队或等待聚合的
+Agent 回合，不再处理这个旧 session。历史 transcript 仍按保留策略保存；后来创建的
+临时频道使用新的 channel ID，因此会进入新的 session。
 
 ### 管理员边界
 
@@ -166,13 +171,13 @@ CHATBIRD_ADMIN_CHANNELS=111111111111111111:222222222222222222
 
 1. 当前 Guild 已加入 `discord.allowed_guilds`；
 2. 当前频道 ID 或所属 Category ID 已加入 `discord.allowed_channels`；
-3. 普通频道能通过 `category`/`category_id` 解析 Category；
+3. Guild 频道（包括语音频道内置文字聊天）能通过 `category`/`category_id` 解析 Category；
 4. Thread 能通过 `parent`/`parent_id` 解析父频道；
 5. 消息确实提及了 Bot，或回复了 Bot 的消息。
 
-旧实现只读取 Thread 的 `parent` 字段，导致位于已允许 Category 内的普通文字频道被
-误判为未授权。当前补丁已分别处理 Category 与 Thread，并为普通消息和 Slash
-Command 提供回归测试。
+旧实现只读取 Thread 的 `parent` 字段，导致位于已允许 Category 内的普通文字频道和
+语音频道内置文字聊天被误判为未授权。当前补丁已分别处理 Category 与 Thread，并为
+普通文字消息、语音频道内置文字聊天、Slash Command 和频道删除清理提供回归测试。
 
 ### 为什么要维护补丁栈？
 

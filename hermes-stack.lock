@@ -8,5 +8,12 @@ patch patches/hermes-chatbird-home-notice.patch
 patch patches/hermes-chatbird-slash-policy.patch
 patch patches/hermes-discord-category-channel-allowlist.patch
 patch patches/hermes-skill-policy-exception.patch
+patch patches/hermes-public-skills-web-extract.patch
+patch patches/hermes-web-browser-fallback.patch
 overlay patches/hermes-tests/test_discord_chatbird_access.py tests/plugins/test_discord_chatbird_access.py
 overlay patches/hermes-tests/test_chatbird_skill_policy_exception.py tests/agent/test_chatbird_skill_policy_exception.py
+overlay patches/hermes-tests/test_public_skill_policy.py tests/tools/test_public_skill_policy.py
+overlay patches/hermes-tests/test_public_skill_mutation_review.py tests/tools/test_public_skill_mutation_review.py
+overlay patches/hermes-tests/test_public_skill_independent_review.py tests/run_agent/test_public_skill_independent_review.py
+overlay patches/hermes-tests/test_simple_http_extract.py tests/tools/test_simple_http_extract.py
+overlay patches/hermes-tests/test_web_browser_fallback.py tests/tools/test_web_browser_fallback.py

@@ -7,8 +7,28 @@ model:
 group_sessions_per_user: false
 
 web:
-  # No-key DuckDuckGo search. URL extraction requires a separate backend.
+  # Both are no-key and request-driven; the extractor has no resident service.
   search_backend: ddgs
+  extract_backend: simple-http
+  # Local Chromium starts only after the primary provider fails. Public users
+  # still receive only web_search/web_extract, never browser_*.
+  browser_fallback:
+    enabled: true
+    search: true
+    extract: true
+    require_cloud: false
+    max_pages: 2
+    settle_seconds: 8
+    min_content_chars: 200
+    max_content_chars: 100000
+    reader_enabled: true
+    reader_allowed_hosts:
+      - www.vicioussyndicate.com
+    reader_timeout_seconds: 20
+
+browser:
+  cloud_provider: local
+  engine: chrome
 
 discord:
   require_mention: true
@@ -16,6 +36,7 @@ discord:
   auto_thread: false
   allowed_channels:
     - "1146359015715110992"
+    - "1149352792532734052" # Temporary voice rooms and their built-in text chat
     - "1170057013569536100"
     - "1395894673792569374"
     - "921407984586866781"

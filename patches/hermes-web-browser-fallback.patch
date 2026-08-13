@@ -1,0 +1,864 @@
+--- a/tools/web_tools.py
++++ b/tools/web_tools.py
+@@ -875,6 +875,23 @@
+             )
+             response_data = provider.search(query, limit)
+ 
++            # Optional restricted browser fallback.  This is an internal
++            # implementation detail of web_search: callers never receive the
++            # interactive browser toolset.  It runs only when the primary
++            # provider failed or returned no hits, and only when an explicitly
++            # configured browser backend passes its readiness check.
++            try:
++                from tools.web_browser_fallback import maybe_search_with_browser
++
++                response_data = maybe_search_with_browser(
++                    response_data, query=query, limit=limit
++                )
++            except Exception as fallback_exc:
++                logger.warning(
++                    "Restricted browser search fallback failed closed: %s",
++                    fallback_exc,
++                )
++
+         debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
+         result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
+         debug_call_data["final_response_size"] = len(result_json)
+@@ -893,6 +910,31 @@
+         return tool_error(error_msg)
+ 
+ 
++def _sync_extract_with_browser_fallback(
++    provider: Any,
++    safe_urls: List[str],
++    *,
++    format: Optional[str],
++) -> List[Dict[str, Any]]:
++    """Run a synchronous provider and optional browser retry in one worker.
++
++    Keeping both blocking phases in the same ``asyncio.to_thread`` call avoids
++    a second executor handoff and ensures the browser session lifecycle remains
++    wholly outside the shared gateway event loop.
++    """
++    results = provider.extract(safe_urls, format=format)
++    try:
++        from tools.web_browser_fallback import maybe_extract_with_browser
++
++        return maybe_extract_with_browser(results, safe_urls)
++    except Exception as fallback_exc:
++        logger.warning(
++            "Restricted browser extract fallback failed closed: %s",
++            fallback_exc,
++        )
++        return results
++
++
+ async def web_extract_tool(
+     urls: List[str],
+     format: str = None,
+@@ -1037,11 +1079,25 @@
+             import inspect
+             if inspect.iscoroutinefunction(provider.extract):
+                 results = await provider.extract(safe_urls, format=format)
++                try:
++                    from tools.web_browser_fallback import maybe_extract_with_browser
++
++                    results = await asyncio.to_thread(
++                        maybe_extract_with_browser, results, safe_urls
++                    )
++                except Exception as fallback_exc:
++                    logger.warning(
++                        "Restricted browser extract fallback failed closed: %s",
++                        fallback_exc,
++                    )
+             else:
+-                # Run sync extract() in a thread so we don't block the
+-                # event loop on network I/O.
++                # Run the sync provider and optional browser fallback in one
++                # worker so neither phase blocks the gateway event loop.
+                 results = await asyncio.to_thread(
+-                    provider.extract, safe_urls, format=format
++                    _sync_extract_with_browser_fallback,
++                    provider,
++                    safe_urls,
++                    format=format,
+                 )
+ 
+         # Merge any SSRF-blocked results back in
+--- /dev/null
++++ b/tools/web_browser_fallback.py
+@@ -0,0 +1,774 @@
++"""Restricted browser fallback for the public web search/extract tools.
++
++This module deliberately exposes no interactive browser surface.  It uses a
++fresh, short-lived browser session only after the configured web provider is
++blocked or returns no useful content, reads a fixed set of DOM fields, and
++then closes the session.  Public callers continue to invoke only
++``web_search`` and ``web_extract``.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import re
++import threading
++import time
++import urllib.parse
++import uuid
++from typing import Any, Dict, Iterable, List, Optional
++
++import requests
++
++from tools.url_safety import is_safe_url, normalize_url_for_request
++from tools.website_policy import check_website_access
++
++
++logger = logging.getLogger(__name__)
++
++_BROWSER_SLOT = threading.BoundedSemaphore(1)
++_CHALLENGE_TITLE_MARKERS = (
++    "access denied",
++    "attention required",
++    "are you a robot",
++    "bot detected",
++    "captcha",
++    "checking your browser",
++    "ddos protection",
++    "just a moment",
++    "please verify",
++    "security verification",
++    "verification required",
++)
++_CHALLENGE_CONTENT_MARKERS = (
++    "cf-chl-",
++    "checking your browser before accessing",
++    "enable javascript and cookies to continue",
++    "performing security verification",
++    "please stand by, while we are checking your browser",
++    "ray id:",
++    "our systems have detected unusual traffic",
++    "performing security verification",
++    "this page checks to see if it's really you",
++    "verify you are human",
++)
++_RETRYABLE_ERROR_MARKERS = (
++    "http 403",
++    "http 408",
++    "http 409",
++    "http 425",
++    "http 500",
++    "http 502",
++    "http 503",
++    "http 504",
++    "connection reset",
++    "connection refused",
++    "primary extractor returned no result",
++    "remote end closed",
++    "temporarily unavailable",
++    "timed out",
++    "timeout",
++)
++_NON_RETRYABLE_ERROR_MARKERS = (
++    "blocked:",
++    "http 429",
++    "private or internal",
++    "cloud metadata",
++    "download limit",
++    "exceeds 4 mib",
++    "exceeds 8 mib",
++    "redirect limit",
++    "unsupported content",
++)
++
++
++def _fallback_config() -> Dict[str, Any]:
++    try:
++        from hermes_cli.config import load_config
++
++        web = load_config().get("web", {})
++    except Exception:
++        return {}
++    if not isinstance(web, dict):
++        return {}
++    raw = web.get("browser_fallback", {})
++    if isinstance(raw, bool):
++        return {"enabled": raw}
++    return raw if isinstance(raw, dict) else {}
++
++
++def _bool_config(config: Dict[str, Any], key: str, default: bool) -> bool:
++    value = config.get(key, default)
++    if isinstance(value, str):
++        return value.strip().lower() in {"1", "true", "yes", "on"}
++    return bool(value)
++
++
++def _int_config(
++    config: Dict[str, Any], key: str, default: int, minimum: int, maximum: int
++) -> int:
++    try:
++        value = int(config.get(key, default))
++    except (TypeError, ValueError):
++        value = default
++    return min(max(value, minimum), maximum)
++
++
++def fallback_enabled(capability: str) -> bool:
++    config = _fallback_config()
++    if not _bool_config(config, "enabled", False):
++        return False
++    return _bool_config(config, capability, True)
++
++
++def browser_backend_ready() -> bool:
++    """Return whether the configured fallback browser satisfies its boundary."""
++    config = _fallback_config()
++    try:
++        from tools import browser_tool
++
++        if _bool_config(config, "require_cloud", True):
++            # A local/CDP browser inherits the production host's network reach
++            # and datacenter IP.  Public web fallback defaults to a managed
++            # cloud browser both for SSRF isolation and anti-bot effectiveness.
++            if browser_tool._get_cloud_provider() is None:
++                return False
++        return bool(browser_tool.check_browser_requirements())
++    except Exception as exc:
++        logger.debug("Browser fallback readiness check failed: %s", exc)
++        return False
++
++
++def _challenge_page(title: str, content: str) -> bool:
++    title_sample = title.lower()
++    content_sample = content[:8000].lower()
++    return any(marker in title_sample for marker in _CHALLENGE_TITLE_MARKERS) or any(
++        marker in content_sample for marker in _CHALLENGE_CONTENT_MARKERS
++    )
++
++
++def _extract_needs_fallback(result: Dict[str, Any], min_chars: int) -> bool:
++    error = str(result.get("error") or "").lower()
++    if error and any(marker in error for marker in _NON_RETRYABLE_ERROR_MARKERS):
++        return False
++    if error and any(marker in error for marker in _RETRYABLE_ERROR_MARKERS):
++        return True
++    title = str(result.get("title") or "")
++    content = str(result.get("content") or result.get("raw_content") or "")
++    if _challenge_page(title, content):
++        return True
++    return not error and len(content.strip()) < min_chars
++
++
++def _json_tool_result(raw: Any) -> Dict[str, Any]:
++    if isinstance(raw, dict):
++        return raw
++    try:
++        parsed = json.loads(str(raw))
++    except (TypeError, ValueError, json.JSONDecodeError):
++        return {"success": False, "error": "Browser returned malformed output"}
++    return (
++        parsed
++        if isinstance(parsed, dict)
++        else {
++            "success": False,
++            "error": "Browser returned an unexpected output type",
++        }
++    )
++
++
++def _safe_public_url(url: str) -> bool:
++    try:
++        normalized = normalize_url_for_request(url)
++        parsed = urllib.parse.urlsplit(normalized)
++        return (
++            parsed.scheme.lower() in {"http", "https"}
++            and bool(parsed.hostname)
++            and check_website_access(normalized) is None
++            and is_safe_url(normalized)
++        )
++    except Exception:
++        return False
++
++
++def _configured_reader_hosts(config: Dict[str, Any]) -> set[str]:
++    """Return the explicit host allowlist for the optional read-only service."""
++    raw = config.get("reader_allowed_hosts", [])
++    if isinstance(raw, str):
++        raw = [part.strip() for part in raw.split(",")]
++    if not isinstance(raw, (list, tuple, set)):
++        return set()
++    return {
++        str(host).strip().lower().rstrip(".")
++        for host in raw
++        if str(host).strip()
++    }
++
++
++def _reader_host_allowed(url: str, config: Dict[str, Any]) -> bool:
++    try:
++        host = (urllib.parse.urlsplit(url).hostname or "").lower().rstrip(".")
++    except ValueError:
++        return False
++    return bool(host and host in _configured_reader_hosts(config))
++
++
++def _reader_extract(
++    url: str, *, min_chars: int, max_chars: int
++) -> tuple[Optional[Dict[str, str]], Optional[str]]:
++    """Read one explicitly allowed public page through Jina Reader.
++
++    This is a final, non-interactive fallback for sites that reject the local
++    datacenter browser.  It is deliberately host-allowlisted: arbitrary public
++    URLs are never forwarded to the third-party reader service.
++    """
++    config = _fallback_config()
++    if not _bool_config(config, "reader_enabled", False):
++        return None, "Read-only service fallback is disabled"
++    if not _safe_public_url(url) or not _reader_host_allowed(url, config):
++        return None, "URL is not allowed for the read-only service fallback"
++
++    normalized = normalize_url_for_request(url)
++    parsed = urllib.parse.urlsplit(normalized)
++    # Never forward credentials, fragments, or user-controlled query data to
++    # the third-party reader service. The allowlisted article pages use clean
++    # paths, so rejecting queries is the safer public-bot boundary.
++    if parsed.username or parsed.password or parsed.query:
++        return None, "Credential-bearing or query URLs are not allowed"
++    source_url = urllib.parse.urlunsplit(
++        (parsed.scheme, parsed.netloc, parsed.path or "/", "", "")
++    )
++    reader_url = f"https://r.jina.ai/{source_url}"
++    timeout = _int_config(config, "reader_timeout_seconds", 20, 5, 30)
++    byte_limit = min(max(max_chars * 4, 100_000), 2_000_000)
++
++    response = None
++    try:
++        response = requests.get(
++            reader_url,
++            headers={"Accept": "text/plain", "X-No-Cache": "true"},
++            timeout=timeout,
++            stream=True,
++            allow_redirects=False,
++        )
++        if response.status_code != 200:
++            return None, f"Read-only service returned HTTP {response.status_code}"
++        content_type = str(response.headers.get("content-type") or "").lower()
++        if content_type and not content_type.startswith("text/plain"):
++            return None, "Read-only service returned an unsupported content type"
++
++        chunks: List[bytes] = []
++        size = 0
++        for chunk in response.iter_content(chunk_size=16_384):
++            if not chunk:
++                continue
++            size += len(chunk)
++            if size > byte_limit:
++                return None, "Read-only service response exceeded its size limit"
++            chunks.append(chunk)
++        text = b"".join(chunks).decode("utf-8", errors="replace")
++    except requests.RequestException as exc:
++        return None, f"Read-only service request failed: {exc}"
++    finally:
++        try:
++            if response is not None:
++                response.close()
++        except Exception:
++            pass
++
++    title_match = re.search(r"(?m)^Title:\s*(.+?)\s*$", text)
++    source_match = re.search(r"(?m)^URL Source:\s*(\S+)\s*$", text)
++    title = title_match.group(1).strip() if title_match else ""
++    returned_source = source_match.group(1).strip() if source_match else source_url
++    if not _safe_public_url(returned_source) or not _reader_host_allowed(
++        returned_source, config
++    ):
++        return None, "Read-only service returned an unexpected source URL"
++    try:
++        returned_host = (urllib.parse.urlsplit(returned_source).hostname or "").lower()
++    except ValueError:
++        return None, "Read-only service returned a malformed source URL"
++    if returned_host != (parsed.hostname or "").lower():
++        return None, "Read-only service crossed the allowed source host"
++
++    marker = "Markdown Content:"
++    content = text.split(marker, 1)[1].lstrip() if marker in text else text
++    content = content[:max_chars]
++    if len(content.strip()) < min_chars or _challenge_page(title, content):
++        return None, "Read-only service returned empty or challenge-protected content"
++    return {
++        "url": returned_source,
++        "title": title,
++        "content": content,
++    }, None
++
++
++def _acquire_browser_slot(config: Dict[str, Any]) -> bool:
++    timeout = _int_config(config, "queue_timeout_seconds", 5, 1, 30)
++    return _BROWSER_SLOT.acquire(timeout=timeout)
++
++
++def _browser_dom(
++    url: str,
++    *,
++    expression: str,
++    min_chars: int,
++    task_prefix: str,
++) -> tuple[Optional[Any], Optional[str]]:
++    """Navigate, run one fixed expression, poll challenges, and clean up."""
++    if not _safe_public_url(url):
++        return None, "Browser fallback rejected a non-public or blocked URL"
++
++    config = _fallback_config()
++    if not _acquire_browser_slot(config):
++        return None, "Browser fallback is busy"
++
++    task_id = f"{task_prefix}-{uuid.uuid4().hex}"
++    try:
++        from tools.browser_tool import browser_console, browser_navigate
++
++        navigation = _json_tool_result(browser_navigate(url, task_id=task_id))
++        if not navigation.get("success"):
++            return None, str(navigation.get("error") or "Browser navigation failed")
++
++        final_url = str(navigation.get("url") or url)
++        # Re-check the final URL independently.  This remains mandatory even
++        # when the browser backend performs its own redirect checks.
++        if not _safe_public_url(final_url):
++            return None, "Browser redirect left the public Internet boundary"
++
++        settle_seconds = _int_config(config, "settle_seconds", 8, 0, 20)
++        deadline = time.monotonic() + settle_seconds
++        last_error = "Browser page had no readable content"
++        while True:
++            evaluated = _json_tool_result(
++                browser_console(expression=expression, task_id=task_id)
++            )
++            if evaluated.get("success"):
++                value = evaluated.get("result")
++                if isinstance(value, str):
++                    try:
++                        value = json.loads(value)
++                    except (ValueError, json.JSONDecodeError):
++                        pass
++                if isinstance(value, dict):
++                    evaluated_url = str(value.get("url") or final_url)
++                    if not _safe_public_url(evaluated_url):
++                        return None, "Browser page left the public Internet boundary"
++                    title = str(value.get("title") or navigation.get("title") or "")
++                    content = str(value.get("content") or "")
++                    if len(content.strip()) >= min_chars and not _challenge_page(
++                        title, content
++                    ):
++                        value["url"] = evaluated_url
++                        value["title"] = title
++                        return value, None
++                last_error = "Browser page remained empty or challenge-protected"
++            else:
++                last_error = str(evaluated.get("error") or "Browser DOM read failed")
++
++            if time.monotonic() >= deadline:
++                return None, last_error
++            time.sleep(min(2, max(0.1, deadline - time.monotonic())))
++    except Exception as exc:
++        logger.warning("Restricted browser fallback failed: %s", exc)
++        return None, str(exc)
++    finally:
++        try:
++            from tools.browser_tool import cleanup_browser
++
++            cleanup_browser(task_id)
++        except Exception as exc:
++            logger.debug("Browser fallback cleanup failed for %s: %s", task_id, exc)
++        _BROWSER_SLOT.release()
++
++
++def maybe_extract_with_browser(
++    results: Iterable[Dict[str, Any]], requested_urls: Iterable[str]
++) -> List[Dict[str, Any]]:
++    """Replace retryable failed extraction results with restricted browser reads."""
++    output = [dict(item) for item in results]
++    if not fallback_enabled("extract"):
++        return output
++
++    # The read-only Reader fallback is independent of local Chromium. A
++    # missing browser runtime must not prevent an exact-host Reader attempt.
++    browser_ready = browser_backend_ready()
++
++    config = _fallback_config()
++    min_chars = _int_config(config, "min_content_chars", 200, 1, 5000)
++    max_chars = _int_config(config, "max_content_chars", 100_000, 1000, 500_000)
++    max_pages = _int_config(config, "max_pages", 2, 1, 5)
++    requested = [normalize_url_for_request(url) for url in requested_urls]
++    existing = {
++        normalize_url_for_request(str(item.get("url") or ""))
++        for item in output
++        if item.get("url")
++    }
++    for url in requested:
++        if url not in existing:
++            output.append(
++                {
++                    "url": url,
++                    "title": "",
++                    "content": "",
++                    "raw_content": "",
++                    "error": "Primary extractor returned no result",
++                }
++            )
++
++    expression = (
++        "(() => JSON.stringify({"
++        "url: window.location.href,"
++        "title: document.title || '',"
++        "content: (((document.querySelector('main,article,[role=main]') || "
++        "document.body) || {}).innerText || '').slice(0, "
++        f"{max_chars}"
++        ")}))()"
++    )
++    attempted = 0
++    for index, result in enumerate(output):
++        if attempted >= max_pages or not _extract_needs_fallback(result, min_chars):
++            continue
++        url = str(result.get("url") or "")
++        if not url or not _safe_public_url(url):
++            continue
++        attempted += 1
++        if browser_ready:
++            browser_value, browser_error = _browser_dom(
++                url,
++                expression=expression,
++                min_chars=min_chars,
++                task_prefix="web-extract-fallback",
++            )
++        else:
++            browser_value, browser_error = None, "Browser backend is not ready"
++        if isinstance(browser_value, dict):
++            content = str(browser_value.get("content") or "")
++            output[index] = {
++                "url": str(browser_value.get("url") or url),
++                "title": str(browser_value.get("title") or ""),
++                "content": content,
++                "raw_content": content,
++                "metadata": {"retrieval": "browser-fallback"},
++                "retrieval": "browser-fallback",
++            }
++        else:
++            reader_value, reader_error = _reader_extract(
++                url, min_chars=min_chars, max_chars=max_chars
++            )
++            if isinstance(reader_value, dict):
++                content = str(reader_value.get("content") or "")
++                output[index] = {
++                    "url": str(reader_value.get("url") or url),
++                    "title": str(reader_value.get("title") or ""),
++                    "content": content,
++                    "raw_content": content,
++                    "metadata": {"retrieval": "reader-fallback"},
++                    "retrieval": "reader-fallback",
++                }
++            else:
++                logger.info(
++                    "Browser and reader extract fallbacks did not recover %s: "
++                    "browser=%s reader=%s",
++                    url,
++                    browser_error,
++                    reader_error,
++                )
++    return output
++
++
++def _unwrap_search_result(url: str, search_host: str) -> str:
++    try:
++        parsed = urllib.parse.urlsplit(url)
++    except ValueError:
++        return ""
++    query = urllib.parse.parse_qs(parsed.query)
++    host = (parsed.hostname or "").lower()
++    if host.endswith("google.com") and parsed.path == "/url":
++        return str((query.get("q") or query.get("url") or [""])[0])
++    if "duckduckgo.com" in host and query.get("uddg"):
++        return str(query["uddg"][0])
++    if _search_engine_owned_host(host, search_host):
++        return ""
++    return url
++
++
++def _search_engine_owned_host(host: str, search_host: str) -> bool:
++    host = host.lower().rstrip(".")
++    search_host = search_host.lower().rstrip(".")
++    if host == search_host or host.endswith(f".{search_host}"):
++        return True
++    families = {
++        "google": ("google.com", "gstatic.com", "googleusercontent.com"),
++        "bing": ("bing.com", "microsoft.com"),
++        "duckduckgo": ("duckduckgo.com", "duck.ai"),
++        "brave": ("brave.com",),
++    }
++    for marker, suffixes in families.items():
++        if marker in search_host:
++            return any(host == suffix or host.endswith(f".{suffix}") for suffix in suffixes)
++    return False
++
++
++def _hsguru_index_retry_query(query: str) -> Optional[str]:
++    """Return one broad, public-index-only retry for an HSGuru site query."""
++    lowered = query.lower()
++    if not (
++        re.search(r"\bsite:(?:www\.)?hsguru\.com(?:/\S*)?", lowered)
++        or re.search(r"\bhsguru\b", lowered)
++    ):
++        return None
++
++    meta_markers = (
++        "meta",
++        "tier",
++        "winrate",
++        "win rate",
++        "matchup",
++        "archetype",
++        "胜率",
++        "环境",
++        "对局",
++    )
++    deck_markers = (
++        "deck",
++        "build",
++        "list",
++        "code",
++        "牌组",
++        "卡组",
++        "构筑",
++        "代码",
++    )
++    if any(marker in lowered for marker in meta_markers):
++        topic = "meta"
++    elif any(marker in lowered for marker in deck_markers):
++        topic = "decks"
++    else:
++        topic = ""
++    return f"site:hsguru.com HSGuru {topic}".strip()
++
++
++def _retry_hsguru_public_index(
++    primary: Dict[str, Any], query: str, limit: int
++) -> Dict[str, Any]:
++    """Retry a failed explicit HSGuru site query through the same web index.
++
++    HSGuru's published robots rules permit search/reference use while blocking
++    automated API, deck-list, and query-driven statistics routes. This helper
++    therefore asks Yahoo's public index (through the installed DDGS client) for
++    at most two broader queries; it never fetches HSGuru itself.
++    """
++    retry_query = _hsguru_index_retry_query(query)
++    if not retry_query or retry_query.strip().lower() == query.strip().lower():
++        return primary
++    try:
++        from ddgs import DDGS
++
++        safe_limit = min(max(int(limit), 1), 10)
++        queries = [retry_query]
++        broad_query = "site:hsguru.com HSGuru"
++        if retry_query.lower() != broad_query.lower():
++            queries.append(broad_query)
++        raw_hits = []
++        with DDGS(timeout=10) as client:
++            for candidate_query in queries:
++                try:
++                    raw_hits = client.text(
++                        candidate_query,
++                        backend="yahoo",
++                        max_results=safe_limit,
++                    )
++                except Exception as exc:
++                    error = str(exc).lower()
++                    if any(
++                        marker in error
++                        for marker in (
++                            "http 429",
++                            "rate limit",
++                            "rate-limit",
++                            "too many requests",
++                        )
++                    ):
++                        raise
++                    raw_hits = []
++                if raw_hits:
++                    break
++        retried_hits = []
++        for index, hit in enumerate(raw_hits[:safe_limit]):
++            retried_hits.append(
++                {
++                    "title": str(hit.get("title") or ""),
++                    "url": str(hit.get("href") or hit.get("url") or ""),
++                    "description": str(hit.get("body") or ""),
++                    "position": index + 1,
++                }
++            )
++        retried = {"success": bool(retried_hits), "data": {"web": retried_hits}}
++    except Exception as exc:
++        logger.info("HSGuru public-index retry failed: %s", exc)
++        return primary
++
++    hits = (
++        retried.get("data", {}).get("web", [])
++        if isinstance(retried, dict) and isinstance(retried.get("data"), dict)
++        else []
++    )
++    if not retried.get("success") or not hits:
++        return primary
++
++    allowed_hits = []
++    for hit in hits:
++        if not isinstance(hit, dict):
++            continue
++        try:
++            host = (
++                urllib.parse.urlsplit(str(hit.get("url") or "")).hostname or ""
++            ).lower().rstrip(".")
++        except ValueError:
++            continue
++        if host in {"hsguru.com", "www.hsguru.com"}:
++            allowed_hits.append(hit)
++    if not allowed_hits:
++        return primary
++
++    output = dict(retried)
++    output["data"] = dict(retried["data"])
++    output["data"]["web"] = allowed_hits[:safe_limit]
++    output["retrieval"] = "public-index-retry"
++    return output
++
++
++def _clean_search_results(
++    candidates: Iterable[Dict[str, Any]], search_url: str, limit: int
++) -> List[Dict[str, Any]]:
++    search_host = (urllib.parse.urlsplit(search_url).hostname or "").lower()
++    output: List[Dict[str, Any]] = []
++    seen: set[str] = set()
++    for candidate in list(candidates)[:50]:
++        if not isinstance(candidate, dict):
++            continue
++        title = re.sub(r"\s+", " ", str(candidate.get("title") or "")).strip()
++        url = _unwrap_search_result(str(candidate.get("url") or ""), search_host)
++        if not url:
++            continue
++        try:
++            url = normalize_url_for_request(url)
++        except Exception:
++            continue
++        if not title or url in seen or not _safe_public_url(url):
++            continue
++        description = re.sub(
++            r"\s+", " ", str(candidate.get("description") or "")
++        ).strip()
++        if description.startswith(title):
++            description = description[len(title):].strip(" -–—|\n")
++        seen.add(url)
++        output.append(
++            {
++                "title": title[:500],
++                "url": url,
++                "description": description[:1000],
++                "position": len(output) + 1,
++            }
++        )
++        if len(output) >= limit:
++            break
++    return output
++
++
++def maybe_search_with_browser(
++    primary: Dict[str, Any], query: str, limit: int
++) -> Dict[str, Any]:
++    """Use a restricted browser search page only when the primary search fails."""
++    existing = (
++        primary.get("data", {}).get("web", [])
++        if isinstance(primary, dict) and isinstance(primary.get("data"), dict)
++        else []
++    )
++    hsguru_query = _hsguru_index_retry_query(query)
++    if primary.get("success") and existing:
++        if not hsguru_query:
++            return primary
++        has_hsguru_hit = False
++        for hit in existing:
++            if not isinstance(hit, dict):
++                continue
++            try:
++                host = (
++                    urllib.parse.urlsplit(str(hit.get("url") or "")).hostname or ""
++                ).lower().rstrip(".")
++            except ValueError:
++                continue
++            if host in {"hsguru.com", "www.hsguru.com"}:
++                has_hsguru_hit = True
++                break
++        if has_hsguru_hit:
++            return primary
++    primary_error = str(primary.get("error") or "").lower()
++    if any(
++        marker in primary_error
++        for marker in ("http 429", "rate limit", "rate-limit", "too many requests")
++    ):
++        return primary
++    if not fallback_enabled("search"):
++        return primary
++
++    indexed = _retry_hsguru_public_index(primary, query, limit)
++    if indexed is not primary:
++        return indexed
++    if primary.get("success") and existing:
++        return primary
++    if not browser_backend_ready():
++        return primary
++
++    config = _fallback_config()
++    template = str(
++        config.get("search_url_template")
++        or "https://www.google.com/search?q={query}"
++    )
++    if "{query}" not in template:
++        logger.warning("Browser fallback search_url_template is missing {query}")
++        return primary
++    search_url = template.replace("{query}", urllib.parse.quote_plus(query))
++    if not _safe_public_url(search_url):
++        return primary
++
++    candidate_limit = min(max(int(limit) * 10, 20), 50)
++    expression = (
++        "(() => JSON.stringify({"
++        "url: window.location.href,"
++        "title: document.title || '',"
++        "content: ((document.body || {}).innerText || '').slice(0, 20000),"
++        "items: Array.from(document.querySelectorAll('a[href]')).map(a => ({"
++        "title: (a.innerText || a.textContent || '').trim(),"
++        "url: a.href || '',"
++        "description: ((a.closest('div') || a.parentElement || a).innerText || '')"
++        ".trim().slice(0, 1200)"
++        "})).filter(x => x.title && /^https?:/i.test(x.url)).slice(0, "
++        f"{candidate_limit}"
++        ")}))()"
++    )
++    browser_value, browser_error = _browser_dom(
++        search_url,
++        expression=expression,
++        min_chars=1,
++        task_prefix="web-search-fallback",
++    )
++    if isinstance(browser_value, dict) and isinstance(browser_value.get("items"), list):
++        cleaned = _clean_search_results(
++            browser_value["items"], search_url, int(limit)
++        )
++        if cleaned:
++            return {
++                "success": True,
++                "data": {"web": cleaned},
++                "retrieval": "browser-fallback",
++            }
++    logger.info(
++        "Browser search fallback did not recover query %r: %s",
++        query,
++        browser_error,
++    )
++    return primary

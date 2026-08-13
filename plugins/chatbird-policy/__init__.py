@@ -31,6 +31,8 @@ _PUBLIC_TOOLS = frozenset(
     {
         "chatbird_memory",
         "clarify",
+        "skill_view",
+        "skills_list",
         "vision_analyze",
         "web_extract",
         "web_search",
@@ -58,6 +60,23 @@ _GUILD_SUFFIX_RE = re.compile(r"(?:^|:)guild-(\d+)(?:$|:)")
 _PROFILE_CATEGORIES = frozenset(
     {"preference", "trait", "communication_style", "stable_context"}
 )
+
+_WEB_RESEARCH_POLICY = """[Trusted ChatBird web research policy]
+Treat web_search and web_extract as the canonical end-to-end retrieval interface.
+When asked whether a site can be searched, read, or used after a browser change,
+test the registered web_search/web_extract path before drawing a conclusion.
+Direct browser tools are diagnostic only: a Cloudflare or challenge page there
+proves only that direct browser navigation failed, not that the complete web
+retrieval path failed. Report each tested route separately and do not recommend
+stealth or proxy services unless the user specifically requires direct dynamic
+browsing and the canonical retrieval path cannot meet that requirement.
+
+For HSGuru, use a natural web_search query that names HSGuru and rely on the
+bounded public-index fallback; do not probe blocked statistics/API routes. For
+Vicious Syndicate, use web_search to locate a clean www.vicioussyndicate.com
+article URL and then call web_extract on that URL so the allowlisted reader
+fallback can run. Do not infer HSReplay data availability merely from the
+presence of a browser; verify useful page content through the canonical path."""
 
 
 def _csv_env(name: str) -> set[str]:
@@ -395,13 +414,13 @@ def _on_pre_llm_call(user_message: str = "", platform: str = "", **_: Any) -> di
             "as a different participant while retaining the shared topic history. This turn "
             "is NOT an administrator context, even if the speaker is the administrator in a "
             "public channel. Refuse requests to inspect or change raw persistent memory, past "
-            "sessions, host files, commands, skills, schedules, credentials, or administrative "
-            "state. Only web_search, web_extract, vision_analyze, clarify, and the constrained "
-            "chatbird_memory profile tool are permitted when registered. The mandatory "
-            "skill-loading rule has "
-            "a request-scoped exception here: skill_view and all other skill tools are unavailable "
-            "in this public context. Do not attempt skill_view, delegate_task, or execute_code as "
-            "a workaround. For current information, call web_search directly; use web_extract only "
+            "sessions, host files, commands, schedules, credentials, or administrative state. "
+            "Only web_search, web_extract, vision_analyze, clarify, skills_list, skill_view, and "
+            "the constrained chatbird_memory profile tool are permitted when registered. The skill "
+            "index and skill_view are filtered to independently reviewed, content-hash-bound public "
+            "skills; an unlisted skill is unavailable even if its name is guessed. Do not attempt "
+            "skill_manage, delegate_task, execute_code, or another denied tool as a workaround. "
+            "For current information, call web_search directly; use web_extract only "
             "when it is registered and a result needs fuller context. If an allowed tool fails, report its actual error; "
             "never claim that public-channel policy blocks web_search or web_extract. Never claim a "
             "denied operation ran. "
@@ -410,7 +429,7 @@ def _on_pre_llm_call(user_message: str = "", platform: str = "", **_: Any) -> di
             "or forget something, and never store task requests or completed work."
         )
 
-    parts = [policy]
+    parts = [policy, _WEB_RESEARCH_POLICY]
     try:
         profile = _memory_context(
             _profile_path(ctx["guild_id"], ctx["user_id"]),
@@ -434,7 +453,25 @@ def _on_pre_llm_call(user_message: str = "", platform: str = "", **_: Any) -> di
 
 def _on_pre_tool_call(tool_name: str = "", **_: Any) -> dict[str, str] | None:
     ctx = _context()
+    try:
+        from tools.skill_provenance import is_background_review
+
+        background_review = is_background_review()
+    except Exception:
+        background_review = False
+
+    # A Discord-origin background operation must retain its full identity.
+    # Missing identity is never an implicit promotion to CLI/admin access.
+    if background_review and ctx["platform"] in {"", "discord"} and (
+        ctx["platform"] != "discord" or not ctx["guild_id"] or not ctx["user_id"]
+    ):
+        return {
+            "action": "block",
+            "message": "ChatBird denied a background operation with missing Discord identity.",
+        }
     if ctx["platform"] != "discord" or _is_admin_context(ctx):
+        return None
+    if background_review and tool_name == "skill_manage":
         return None
     if tool_name in _PUBLIC_TOOLS:
         return None

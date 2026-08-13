@@ -40,7 +40,7 @@ repository defines the behavior, security boundaries, and Hermes integration.
 | --- | --- |
 | Multi-guild isolation | Every conversation session and persistent memory scope includes `guild_id` |
 | Default-deny access | Only explicitly configured `allowed_guilds` and `allowed_channels` are accepted |
-| Category inheritance | Text channels inherit their category allowlist entry; threads inherit their parent channel |
+| Category inheritance | Guild channels, including voice-channel chat, inherit their category allowlist entry; threads inherit their parent channel |
 | Explicit activation | Normal channel messages reach the model only after a mention or reply to the bot |
 | Public tool policy | Public users receive chat, restricted web access, supported attachment analysis, and limited memory operations |
 | Dual administrator checks | Sensitive features require both an administrator user and the current `guild_id:channel_id` |
@@ -150,10 +150,16 @@ discord:
   auto_thread: false
 ```
 
-Normal text channels expose their category through discord.py's
-`category`/`category_id`; threads expose their parent through
-`parent`/`parent_id`. Message and slash-command authorization use the same
-inheritance rule.
+Guild channels, including a voice channel's built-in text chat, expose their
+category through discord.py's `category`/`category_id`; threads expose their
+parent through `parent`/`parent_id`. Message and slash-command authorization
+use the same inheritance rule.
+
+When a temporary voice channel is deleted, the adapter cancels agent turns for
+that channel ID that are running, queued, or waiting to be batched, and stops
+handling the old session. Transcript history remains subject to the retention
+policy. A later temporary channel has a new channel ID and therefore a new
+session.
 
 ### Administrator boundary
 
@@ -182,15 +188,16 @@ Channel authorization runs before the mention check. Confirm, in order:
 1. the current guild appears in `discord.allowed_guilds`;
 2. the channel ID or containing category ID appears in
    `discord.allowed_channels`;
-3. a normal text channel resolves its category through
+3. a guild channel, including voice-channel chat, resolves its category through
    `category`/`category_id`;
 4. a thread resolves its parent through `parent`/`parent_id`;
 5. the message actually mentions the bot or replies to one of its messages.
 
 The previous implementation read only the thread-specific `parent` fields, so
-normal text channels inside an allowed category could be rejected as
-unauthorized. The current patch handles categories and threads separately and
-adds regression coverage for messages and slash commands.
+normal text channels and voice-channel chat inside an allowed category could
+be rejected as unauthorized. The current patch handles categories and threads
+separately and adds regression coverage for text messages, voice-channel chat,
+slash commands, and deleted-channel cleanup.
 
 ### Why maintain a patch stack?
 

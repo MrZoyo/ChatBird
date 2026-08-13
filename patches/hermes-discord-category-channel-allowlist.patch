@@ -1,6 +1,20 @@
 diff --git a/plugins/platforms/discord/adapter.py b/plugins/platforms/discord/adapter.py
 --- a/plugins/platforms/discord/adapter.py
 +++ b/plugins/platforms/discord/adapter.py
+@@ -1097,6 +1097,11 @@ class DiscordAdapter(BasePlatformAdapter):
+-
++
+                 await self._handle_message(message, role_authorized=_role_authorized)
+-
++
++            @self._client.event
++            async def on_guild_channel_delete(channel):
++                """Stop in-flight work whose Discord channel no longer exists."""
++                await adapter_self._cancel_deleted_channel_sessions(channel)
++
+             @self._client.event
+             async def on_voice_state_update(member, before, after):
+                 """Track voice channel join/leave events."""
 @@ -2950,12 +2950,12 @@ class DiscordAdapter(BasePlatformAdapter):
              channel_ids: set = set()
              if chan_id_raw is not None:
@@ -21,7 +35,7 @@ diff --git a/plugins/platforms/discord/adapter.py b/plugins/platforms/discord/ad
 +
              allowed_raw = os.getenv("DISCORD_ALLOWED_CHANNELS", "")
              if allowed_raw:
-@@ -5159,13 +5159,19 @@ class DiscordAdapter(BasePlatformAdapter):
+@@ -5159,13 +5164,71 @@ class DiscordAdapter(BasePlatformAdapter):
              return SendResult(success=False, error=str(e))
 -
 +
@@ -43,6 +57,58 @@ diff --git a/plugins/platforms/discord/adapter.py b/plugins/platforms/discord/ad
          return None
 -
 +
++    @staticmethod
++    def _session_key_targets_discord_channel(session_key: str, channel_id: str) -> bool:
++        """Return whether a session key belongs to a Discord guild channel."""
++        parts = str(session_key).split(":")
++        target = str(channel_id)
++        return any(
++            parts[index] == "discord"
++            and parts[index + 1] in {"group", "channel"}
++            and parts[index + 2] == target
++            for index in range(max(0, len(parts) - 2))
++        )
++
++    async def _cancel_deleted_channel_sessions(self, channel: Any) -> int:
++        """Cancel live and buffered turns for a deleted Discord guild channel.
++
++        Persistent transcripts remain available under the normal Hermes
++        retention policy. A newly created temporary channel receives a new
++        Discord snowflake and therefore a separate session key.
++        """
++        channel_id = getattr(channel, "id", None)
++        if channel_id is None:
++            return 0
++
++        candidate_keys = set(self._active_sessions)
++        candidate_keys.update(self._pending_messages)
++        candidate_keys.update(self._text_debounce_store())
++        candidate_keys.update(self._pending_text_batches)
++        candidate_keys.update(self._pending_text_batch_tasks)
++        target_keys = {
++            key
++            for key in candidate_keys
++            if self._session_key_targets_discord_channel(key, str(channel_id))
++        }
++
++        for key in target_keys:
++            batch_task = self._pending_text_batch_tasks.pop(key, None)
++            if batch_task is not None and not batch_task.done():
++                batch_task.cancel()
++            self._pending_text_batches.pop(key, None)
++
++        if target_keys:
++            await asyncio.gather(
++                *(self.cancel_session_processing(key) for key in target_keys)
++            )
++            logger.info(
++                "[%s] Stopped %d session(s) for deleted Discord channel %s",
++                self.name,
++                len(target_keys),
++                channel_id,
++            )
++        return len(target_keys)
++
      def _is_forum_parent(self, channel: Any) -> bool:
 @@ -5370,11 +5376,10 @@ class DiscordAdapter(BasePlatformAdapter):
          #   discord.auto_thread: Auto-create thread on @mention in channels (default: true)
@@ -60,7 +126,15 @@ diff --git a/plugins/platforms/discord/adapter.py b/plugins/platforms/discord/ad
 diff --git a/tests/gateway/test_discord_channel_controls.py b/tests/gateway/test_discord_channel_controls.py
 --- a/tests/gateway/test_discord_channel_controls.py
 +++ b/tests/gateway/test_discord_channel_controls.py
-@@ -56,10 +56,18 @@ class FakeDMChannel:
+@@ -1,5 +1,6 @@
+ """Tests for Discord ignored_channels and no_thread_channels config."""
+-
++
++import asyncio
+ from types import SimpleNamespace
+ from datetime import datetime, timezone
+ from unittest.mock import AsyncMock, MagicMock
+@@ -56,11 +56,23 @@ class FakeDMChannel:
  
  
  class FakeTextChannel:
@@ -81,7 +155,12 @@ diff --git a/tests/gateway/test_discord_channel_controls.py b/tests/gateway/test
          self.topic = None
  
  
-@@ -100,6 +108,55 @@ def make_message(*, channel, content: str, mentions=None):
++class FakeVoiceChannel(FakeTextChannel):
++    """Voice channels are also the message channel for their built-in chat."""
++
++
+ class FakeThread:
+@@ -100,6 +112,104 @@ def make_message(*, channel, content: str, mentions=None):
      )
  
  
@@ -102,6 +181,28 @@ diff --git a/tests/gateway/test_discord_channel_controls.py b/tests/gateway/test
 +    bot_user = adapter._client.user
 +    message = make_message(
 +        channel=FakeTextChannel(channel_id=501, category=category),
++        content=f"<@{bot_user.id}> hello",
++        mentions=[bot_user],
++    )
++    await adapter._handle_message(message)
++
++    adapter.handle_message.assert_awaited_once()
++
++
++@pytest.mark.asyncio
++async def test_allowed_category_processes_voice_channel_chat(adapter, monkeypatch):
++    """A voice channel's built-in text chat inherits its category allowlist."""
++    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "500")
++    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
++    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
++    monkeypatch.setenv("DISCORD_HISTORY_BACKFILL", "false")
++    monkeypatch.delenv("DISCORD_IGNORED_CHANNELS", raising=False)
++    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
++
++    category = SimpleNamespace(id=500)
++    bot_user = adapter._client.user
++    message = make_message(
++        channel=FakeVoiceChannel(channel_id=501, category=category),
 +        content=f"<@{bot_user.id}> hello",
 +        mentions=[bot_user],
 +    )
@@ -132,6 +233,33 @@ diff --git a/tests/gateway/test_discord_channel_controls.py b/tests/gateway/test
 +
 +    assert allowed is True
 +    assert reason is None
++
++
++@pytest.mark.asyncio
++async def test_deleted_channel_cancels_active_and_buffered_sessions(adapter):
++    """Deleting a temporary channel stops work without matching sibling sessions."""
++    target_active = "agent:main:discord:group:501:guild-600"
++    target_buffered = "agent:main:discord:group:501:42:guild-600"
++    sibling = "agent:main:discord:group:502:guild-600"
++    batch_task = MagicMock()
++    batch_task.done.return_value = False
++
++    adapter._active_sessions[target_active] = asyncio.Event()
++    adapter._pending_text_batches[target_buffered] = object()
++    adapter._pending_text_batch_tasks[target_buffered] = batch_task
++    adapter._active_sessions[sibling] = asyncio.Event()
++    adapter.cancel_session_processing = AsyncMock()
++
++    count = await adapter._cancel_deleted_channel_sessions(SimpleNamespace(id=501))
++
++    assert count == 2
++    assert {call.args[0] for call in adapter.cancel_session_processing.await_args_list} == {
++        target_active,
++        target_buffered,
++    }
++    assert target_buffered not in adapter._pending_text_batches
++    assert target_buffered not in adapter._pending_text_batch_tasks
++    batch_task.cancel.assert_called_once_with()
 +
 +
  # ── ignored_channels ─────────────────────────────────────────────────

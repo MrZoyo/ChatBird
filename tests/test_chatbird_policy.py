@@ -1,7 +1,9 @@
 import importlib.util
 import json
 import os
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -56,19 +58,48 @@ class ChatBirdPolicyTests(unittest.TestCase):
 
     def test_public_tool_allowlist_blocks_sensitive_tools(self):
         self.assertIsNone(MODULE._on_pre_tool_call("web_search"))
+        self.assertIsNone(MODULE._on_pre_tool_call("skills_list"))
+        self.assertIsNone(MODULE._on_pre_tool_call("skill_view"))
         result = MODULE._on_pre_tool_call("memory")
         self.assertEqual(result["action"], "block")
         self.assertIn("public-channel policy", result["message"])
 
-    def test_public_prompt_bypasses_skills_and_uses_web_search_directly(self):
+    def test_public_prompt_exposes_only_filtered_skills(self):
         context = MODULE._on_pre_llm_call(
             user_message="搜索最新的艾克打野攻略",
             platform="discord",
         )["context"]
 
-        self.assertIn("request-scoped exception", context)
+        self.assertIn("independently reviewed", context)
+        self.assertIn("unlisted skill is unavailable", context)
         self.assertIn("call web_search directly", context)
         self.assertIn("never claim that public-channel policy blocks web_search", context)
+
+    def test_public_prompt_requires_end_to_end_web_validation(self):
+        context = MODULE._on_pre_llm_call(
+            user_message="浏览器装好了，检查这些网站能不能用",
+            platform="discord",
+        )["context"]
+
+        self.assertIn("canonical end-to-end retrieval interface", context)
+        self.assertIn("test the registered web_search/web_extract path", context)
+        self.assertIn("proves only that direct browser navigation failed", context)
+        self.assertIn("For HSGuru", context)
+        self.assertIn("Vicious Syndicate", context)
+
+    def test_admin_prompt_also_requires_end_to_end_web_validation(self):
+        with patch.dict(
+            os.environ,
+            {"HERMES_SESSION_USER_ID": "1", "HERMES_SESSION_CHAT_ID": "999"},
+        ):
+            context = MODULE._on_pre_llm_call(
+                user_message="验证网页查询能力",
+                platform="discord",
+            )["context"]
+
+        self.assertIn("Administrator tools are allowed", context)
+        self.assertIn("Direct browser tools are diagnostic only", context)
+        self.assertIn("then call web_extract", context)
 
     def test_admin_needs_user_and_matching_guild_channel_pair(self):
         with patch.dict(
@@ -157,6 +188,59 @@ class ChatBirdPolicyTests(unittest.TestCase):
         self.assertIn("chatbird_memory", ctx.tools)
         self.assertIn("pre_llm_call", ctx.hooks)
         self.assertIn("pre_tool_call", ctx.hooks)
+
+    def test_background_review_missing_discord_identity_fails_closed(self):
+        provenance = types.ModuleType("tools.skill_provenance")
+        provenance.is_background_review = lambda: True
+        tools = types.ModuleType("tools")
+        tools.skill_provenance = provenance
+        with patch.dict(
+            os.environ,
+            {
+                "HERMES_SESSION_PLATFORM": "",
+                "HERMES_SESSION_USER_ID": "",
+                "HERMES_SESSION_CHAT_ID": "",
+                "HERMES_SESSION_KEY": "",
+            },
+        ), patch.dict(
+            sys.modules,
+            {"tools": tools, "tools.skill_provenance": provenance},
+        ):
+            result = MODULE._on_pre_tool_call("skill_manage")
+        self.assertEqual(result["action"], "block")
+        self.assertIn("missing Discord identity", result["message"])
+
+    def test_public_background_review_can_manage_skills_but_not_raw_memory(self):
+        provenance = types.ModuleType("tools.skill_provenance")
+        provenance.is_background_review = lambda: True
+        tools = types.ModuleType("tools")
+        tools.skill_provenance = provenance
+        with patch.dict(
+            sys.modules,
+            {"tools": tools, "tools.skill_provenance": provenance},
+        ):
+            self.assertIsNone(MODULE._on_pre_tool_call("skill_manage"))
+            result = MODULE._on_pre_tool_call("memory")
+        self.assertEqual(result["action"], "block")
+
+    def test_non_discord_background_review_keeps_normal_tool_access(self):
+        provenance = types.ModuleType("tools.skill_provenance")
+        provenance.is_background_review = lambda: True
+        tools = types.ModuleType("tools")
+        tools.skill_provenance = provenance
+        with patch.dict(
+            os.environ,
+            {
+                "HERMES_SESSION_PLATFORM": "local",
+                "HERMES_SESSION_USER_ID": "",
+                "HERMES_SESSION_CHAT_ID": "",
+                "HERMES_SESSION_KEY": "",
+            },
+        ), patch.dict(
+            sys.modules,
+            {"tools": tools, "tools.skill_provenance": provenance},
+        ):
+            self.assertIsNone(MODULE._on_pre_tool_call("skill_manage"))
 
 
 if __name__ == "__main__":
