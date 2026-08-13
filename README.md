@@ -1,244 +1,222 @@
-# ChatBird
+<p align="center">
+  <img src="assets/chatbird-banner.png" alt="ChatBird banner" width="100%">
+</p>
 
-> 最后核对：2026-08-13（Europe/Berlin）
+<h1 align="center">ChatBird</h1>
 
-ChatBird（小鸟聊天助手，昵称“乌鸦”）是一个面向 Discord 的多服务器 AI
-助手。项目以 [Hermes Agent](https://github.com/NousResearch/hermes-agent)
-为运行框架，通过 Xiaomi MiMo 提供模型能力，并针对公开 Discord Bot 的权限、
-会话隔离、持久记忆和生产运维进行了定制。
+<p align="center">
+  <strong>面向多 Discord 服务器的安全 AI 助手</strong>
+</p>
 
-当前生产模型为 `mimo-v2.5`，由 `hermes-gateway.service` 持续运行。
-网页搜索使用无需密钥的 DDGS 后端；网页正文提取需另行配置提取后端。
+<p align="center">
+  简体中文 · <a href="README_EN.md">English</a>
+</p>
 
-## 维护快速入口
+<p align="center">
+  <a href="https://github.com/NousResearch/hermes-agent">
+    <img src="https://img.shields.io/badge/BUILT%20ON-HERMES%20AGENT-6C5CE7?style=for-the-badge" alt="Built on Hermes Agent">
+  </a>
+  <a href="PRIVACY.md">
+    <img src="https://img.shields.io/badge/PRIVACY-GUILD%20ISOLATED-2EA44F?style=for-the-badge" alt="Guild-isolated privacy">
+  </a>
+  <a href="hermes-stack.lock">
+    <img src="https://img.shields.io/badge/INTEGRATION-REPRODUCIBLE-0969DA?style=for-the-badge" alt="Reproducible integration">
+  </a>
+</p>
 
-| 任务 | 入口 |
-|---|---|
-| 查看生产现状和 Discord ID 映射 | [`docs/production-state.md`](docs/production-state.md) |
-| 理解补丁顺序和锁定基线 | [`hermes-stack.lock`](hermes-stack.lock) |
-| 检查或应用完整 Hermes 补丁栈 | [`scripts/apply-hermes-patches.sh`](scripts/apply-hermes-patches.sh) |
-| 查看补丁维护约束 | [`patches/README.md`](patches/README.md) |
-| 只读检查生产主机 | [`scripts/check-server.sh`](scripts/check-server.sh) |
-| 查看多人权限和记忆策略 | [`docs/multi-user-policy.md`](docs/multi-user-policy.md) |
+ChatBird（小鸟聊天助手，昵称“乌鸦”）是一套基于
+[Hermes Agent](https://github.com/NousResearch/hermes-agent) 的 Discord AI 助手
+集成方案。它让一个 Bot 账号安全地服务多个 Guild，并为公开频道补充权限控制、
+会话与记忆隔离、受限工具、网页检索和可重建的补丁管理。
 
-新维护者应先读生产状态，再从锁定基线执行补丁栈 `--check`。不要把生产 Hermes
-工作树或 `/root/.hermes/.env` 当作长期来源；仓库 `main` 才是唯一长期来源。
+ChatBird 不绑定特定模型提供商、云平台或服务器。你可以按自己的环境选择模型、
+主机和部署方式；仓库只定义行为、安全边界和 Hermes 集成补丁。
 
-## 核心能力
+## 主要能力
 
-- 一个 Discord Bot 账号可服务多个经过批准的 Guild。
-- 每个 Guild 拥有独立的会话和持久记忆命名空间，数据不会跨 Guild 混用。
-- Guild 和频道白名单默认拒绝未配置范围；普通文字频道可继承所属 Category 的白名单。
-- 用户仅在明确 `@` Bot 或回复 Bot 时触发模型；同一频道成员共享频道会话。
-- 普通用户仅开放对话、网络查询、支持的附件分析和受限记忆能力。
-- 管理功能同时校验管理员用户 ID 和当前 Guild 的私密管理员频道。
-- Discord 私信不会获得回复，也不会进入模型会话；私信文本和有限附件元数据可记录到受限日志。
-- 原生 Slash Commands 分为公开命令和管理员命令，并复用同一套 Guild/频道授权边界。
+| 能力 | 说明 |
+| --- | --- |
+| 多 Guild 隔离 | 会话和持久记忆均包含 `guild_id`，防止跨服务器读取上下文 |
+| 默认拒绝的访问控制 | 仅接受 `allowed_guilds` 和 `allowed_channels` 明确允许的范围 |
+| Category 继承 | 文字频道继承所属 Category 的白名单；Thread 继承父频道 |
+| 明确触发 | 普通频道仅在用户 `@` Bot 或回复 Bot 时触发模型 |
+| 公开频道工具策略 | 普通用户只获得对话、受限网页查询、支持的附件分析和受限记忆能力 |
+| 管理员双重校验 | 敏感能力同时校验管理员用户和当前 `guild_id:channel_id` |
+| 私信隔离 | 私信不进入模型会话，也不获得 Bot 回复 |
+| 可重建集成 | 上游提交、补丁顺序和测试覆盖统一记录在 `hermes-stack.lock` |
 
-## 安全边界
-
-ChatBird 的首要隔离契约是：**任何 Discord 会话和持久记忆都不能跨 Guild
-边界访问。**
-
-生产访问按以下顺序收紧：
-
-1. `discord.allowed_guilds`：只接受明确批准的 Guild。
-2. `discord.allowed_channels`：只接受明确频道、Category 及其继承范围。
-3. `discord.require_mention`：普通消息必须明确提及 Bot。
-4. 请求级权限：敏感工具和管理员命令必须同时匹配管理员用户与
-   `guild_id:channel_id` 管理员频道映射。
-
-普通用户和管理员在公开频道中使用相同的安全工具面。管理员只有在对应 Guild
-的私密管理员频道中才进入管理员上下文。生产环境不得使用裸频道 ID 代替
-Guild/频道组合，也不得允许未列入 `allowed_guilds` 的服务器。
-
-## 仓库结构
-
-| 路径 | 用途 |
-|---|---|
-| [`hermes-stack.lock`](hermes-stack.lock) | 锁定 Hermes 上游仓库、基础提交、补丁顺序和测试覆盖文件 |
-| [`patches/`](patches/) | ChatBird 的 Hermes 补丁、生产行为配置和补丁说明 |
-| [`scripts/apply-hermes-patches.sh`](scripts/apply-hermes-patches.sh) | 检查或应用完整 Hermes 补丁栈 |
-| [`scripts/check-server.sh`](scripts/check-server.sh) | 只读检查生产主机资源、Hermes 版本和服务状态 |
-| [`scripts/deploy-env.sh`](scripts/deploy-env.sh) | 从本地环境安全更新生产 `.env` |
-| [`.env.example`](.env.example) | 不含真实凭据的环境变量示例 |
-| [`PRIVACY.md`](PRIVACY.md) | ChatBird 隐私政策 |
-| [`docs/discord-intent-application.md`](docs/discord-intent-application.md) | Discord 特权 Intent 申请说明 |
-| [`docs/bird-bot-guide.md`](docs/bird-bot-guide.md) | Bird-Bot 功能参考 |
-
-## 架构与版本管理
-
-ChatBird 不复制整份 Hermes Agent 源码，而是保存一套可重建的补丁栈：
+## 工作方式
 
 ```text
-NousResearch/hermes-agent @ locked base commit
-  + Guild 会话与记忆隔离
-  + Guild 成员访问与私信日志
-  + Home Channel 提示控制
-  + Slash Command 分级授权
-  + Discord Category 白名单继承
-  + 公共频道 Skill 例外与直接网页搜索
-  + ChatBird 定向测试覆盖
+Discord message
+  -> Guild allowlist
+  -> Channel / Category allowlist
+  -> Mention or reply check
+  -> Guild-scoped session and memory
+  -> Request-scoped tool policy
+  -> Configured model provider
 ```
 
-具体基线和应用顺序以 [`hermes-stack.lock`](hermes-stack.lock) 为准。这样可以保留
-完整上游历史、明确审阅 ChatBird 的差异，并在升级 Hermes 时逐个处理冲突。
+最重要的隔离契约是：**任何 Discord 会话和持久记忆都不能跨 Guild 边界访问。**
+未列入 `discord.allowed_guilds` 的 Guild 必须默认拒绝。
 
-`main` 是 ChatBird 唯一的长期集成分支。临时开发分支合并后即可删除；生产配置、
-补丁栈、策略插件、测试和运维文档都以 `main` 为准。
+## 快速开始
 
-### 从锁定基线重建
+ChatBird 不是 Hermes Agent 的完整副本。部署时先准备一个干净的 Hermes checkout，
+再应用本仓库维护的补丁栈。
 
-准备一个干净的 Hermes checkout，并切换到锁定的基础提交：
+### 1. 准备 Hermes Agent
 
 ```bash
 git clone https://github.com/NousResearch/hermes-agent.git hermes-agent
 git -C hermes-agent checkout f53b184c48712bcbb98556a6314cd1f240fc104d
 ```
 
-先执行无写入检查：
+该提交以 [`hermes-stack.lock`](hermes-stack.lock) 为准；上游基线更新后应使用锁文件
+中的新值。
+
+### 2. 检查并应用补丁
 
 ```bash
 scripts/apply-hermes-patches.sh ./hermes-agent --check
-```
-
-确认全部补丁可应用后再执行：
-
-```bash
 scripts/apply-hermes-patches.sh ./hermes-agent
 ```
 
-脚本会在以下情况失败并停止：checkout 不干净、基础提交不匹配、补丁缺失、补丁
-无法应用，或测试覆盖文件将覆盖上游已有文件。更多说明见
-[`patches/README.md`](patches/README.md)。
+脚本会在 checkout 不干净、基础提交不匹配、补丁缺失、补丁无法应用或测试覆盖文件
+发生冲突时停止。
 
-## 配置
+### 3. 配置部署
 
-生产行为配置参考
-[`patches/chatbird-production-config.yaml`](patches/chatbird-production-config.yaml)。
-其中包含当前 Guild、Category 和频道 ID；在其他环境部署前必须替换为目标 Discord
-服务器的 ID。
+从示例文件开始：
 
-敏感值只应保存在服务器的 `/root/.hermes/.env`，绝不能提交到 Git：
-
-```env
-XIAOMI_API_KEY=...
-DISCORD_BOT_TOKEN=...
-DISCORD_ALLOWED_USERS=...
-DISCORD_ALLOW_ALL_USERS=true
-CHATBIRD_ADMIN_USERS=...
-CHATBIRD_ADMIN_CHANNELS=<guild_id>:<private_admin_channel_id>
-CHATBIRD_HOME_CHANNELS=<guild_id>:<delivery_channel_id>
-CHATBIRD_DISABLE_HOME_CHANNEL_NOTICE=true
-CHATBIRD_DISABLE_DM_REPLIES=true
-CHATBIRD_LOG_DMS=true
-DISCORD_AUTO_THREAD=false
+```bash
+cp config.example.yaml /path/to/hermes/config.yaml
+cp .env.example /path/to/hermes/.env
 ```
 
-重要配置约束：
+至少需要完成以下配置：
 
-- `web.search_backend: ddgs` 提供无需密钥的网页搜索，但不提供网页正文提取。
-- `discord.allowed_guilds` 必须列出每一个生产 Guild，未列入者默认拒绝。
-- `discord.allowed_channels` 可以列出具体频道或 Category ID；子频道继承 Category
-  白名单。
-- `group_sessions_per_user: false` 让同一频道成员共享频道会话，但 Guild 后缀仍确保
-  跨 Guild 隔离。
-- `memory.user_profile_enabled: false` 禁用 Hermes 的共享 `USER.md`，避免多人频道中
-  的用户信息混合。
-- `CHATBIRD_ADMIN_CHANNELS` 必须使用 `guild_id:channel_id`，格式错误时管理员能力
-  默认拒绝。
-- `DISCORD_AUTO_THREAD=false` 保持频道内联对话，不为每次提及创建新线程。
+- 按 Hermes Agent 的配置方式选择模型提供商和模型；
+- 设置 Discord Bot Token；
+- 在 `discord.allowed_guilds` 中列出每个允许的 Guild；
+- 在 `discord.allowed_channels` 中列出允许的频道或 Category；
+- 配置 `CHATBIRD_ADMIN_USERS` 和 `CHATBIRD_ADMIN_CHANNELS`；
+- 保持 `group_sessions_per_user: false` 和 `memory.user_profile_enabled: false`，
+  以使用 ChatBird 的共享频道会话与分层记忆策略。
 
-## Discord 应用设置
+示例中的 ID 和凭据均为占位内容。真实密钥只应保存在部署环境中，不得提交到 Git。
 
-Discord Developer Portal 必须启用：
+### 4. 配置 Discord 应用
 
-- Message Content Intent
-- 使用角色授权、用户名白名单或成员查询时启用 Server Members Intent
+在 [Discord Developer Portal](https://discord.com/developers/applications) 中：
 
-邀请应用时需要：
+1. 创建应用和 Bot 用户。
+2. 启用 **Message Content Intent**。
+3. 如果使用角色授权、用户名白名单或成员查询，启用 **Server Members Intent**。
+4. 使用 `bot` 和 `applications.commands` scope 邀请 Bot。
+5. 仅授予读取频道、查看历史、发送消息、嵌入链接、上传文件、添加反应和使用应用
+   命令等实际需要的权限；不要授予 `Administrator`。
 
-- `bot`
-- `applications.commands`
+权限明细见 [Discord 权限说明](docs/discord-permissions.md)。
 
-不要授予 Bot `Administrator`。只开放读取频道、查看历史、发送消息、嵌入链接、
-上传文件、添加反应以及使用应用命令等实际需要的权限。
+## 配置原则
 
-公开 Slash Commands 为 `/help`、`/whoami`、`/status`、`/version` 和 `/usage`。
-其他命令只允许配置的管理员在对应 Guild 的私密管理员频道使用；私信中的 Slash
-Commands 默认拒绝。
+### 模型与运行环境
+
+ChatBird 不限制模型 API、推理后端、操作系统或云平台。模型连接按 Hermes Agent 的
+方式配置；部署目录、服务管理器和资源限额由运营者决定。主 README 不记录某个实例
+当前使用的模型或服务器，避免把单一部署状态误写成项目要求。
+
+### Guild 与频道白名单
+
+```yaml
+discord:
+  allowed_guilds:
+    - "111111111111111111"
+  allowed_channels:
+    - "222222222222222222" # 频道或 Category ID
+  require_mention: true
+  thread_require_mention: true
+  auto_thread: false
+```
+
+普通文字频道通过 discord.py 的 `category`/`category_id` 读取所属 Category；Thread
+通过 `parent`/`parent_id` 读取父频道。普通消息和 Slash Command 使用相同的继承规则。
+
+### 管理员边界
+
+```env
+CHATBIRD_ADMIN_USERS=123456789012345678
+CHATBIRD_ADMIN_CHANNELS=111111111111111111:222222222222222222
+```
+
+管理员能力只有在用户 ID 和当前 `GuildID:ChannelID` 同时匹配时才会开放。格式错误、
+缺少映射或在公开频道调用都会默认拒绝。
+
+### 网页能力
+
+仓库包含公开频道网页查询的权限策略。搜索和正文提取后端由运营者按部署需求配置；
+公开用户不会因此获得终端、文件、代码执行或交互式浏览器能力。
+
+## 常见问题
+
+### 已经 `@Bot`，为什么没有回复？
+
+频道授权发生在提及检查之前。依次确认：
+
+1. 当前 Guild 已加入 `discord.allowed_guilds`；
+2. 当前频道 ID 或所属 Category ID 已加入 `discord.allowed_channels`；
+3. 普通频道能通过 `category`/`category_id` 解析 Category；
+4. Thread 能通过 `parent`/`parent_id` 解析父频道；
+5. 消息确实提及了 Bot，或回复了 Bot 的消息。
+
+旧实现只读取 Thread 的 `parent` 字段，导致位于已允许 Category 内的普通文字频道被
+误判为未授权。当前补丁已分别处理 Category 与 Thread，并为普通消息和 Slash
+Command 提供回归测试。
+
+### 为什么要维护补丁栈？
+
+ChatBird 保留完整的 Hermes 上游历史，只跟踪经过审阅的差异。升级时可以从锁定的
+上游提交重建、逐个处理冲突，并比较最终文件，而无需长期维护一份上游源码副本。
+
+## 仓库结构
+
+| 路径 | 用途 |
+| --- | --- |
+| [`hermes-stack.lock`](hermes-stack.lock) | 锁定上游仓库、基础提交、补丁顺序和测试覆盖 |
+| [`patches/`](patches/) | Hermes 补丁、参考配置和补丁说明 |
+| [`plugins/chatbird-policy/`](plugins/chatbird-policy/) | 请求级权限与分层记忆策略插件 |
+| [`scripts/apply-hermes-patches.sh`](scripts/apply-hermes-patches.sh) | 检查或应用完整补丁栈 |
+| [`config.example.yaml`](config.example.yaml) | 不含凭据的行为配置示例 |
+| [`.env.example`](.env.example) | 环境变量占位示例 |
+| [`docs/`](docs/) | 权限、隔离、隐私和运维文档 |
 
 ## 验证
 
-补丁栈变更至少应完成以下验证：
+补丁变更至少应完成：
 
-1. 在临时 Hermes worktree 上运行 `--check`。
-2. 从锁定基线实际应用完整补丁栈。
-3. 对修改过的 Python 文件执行语法检查。
-4. 运行 Guild 隔离、记忆隔离、Discord 访问、Home Channel 和 Category 白名单的
-   定向回归测试。
-5. 将重建文件与预期生产文件逐一比较。
+1. 对干净的锁定基线执行 `--check`；
+2. 从锁定基线实际应用完整补丁栈；
+3. 对修改过的 Python 文件执行语法检查；
+4. 运行受影响功能的定向测试；
+5. 检查重建文件是否符合预期。
 
-2026-08-13 的 Category 修复验证包括：频道控制测试文件 16 项通过；完整补丁栈可从
-锁定基线执行 `--check`；重建后的 Discord adapter 和测试文件与生产文件一致。
+避免在资源有限的生产主机上运行全仓扫描、完整测试套件或高并发构建。优先在本地或
+临时 worktree 验证，再部署必要文件并执行定向烟测。
 
-## 故障排查
+## 文档
 
-### 已 `@Bot`，但频道没有回复
+| 文档 | 内容 |
+| --- | --- |
+| [生产状态](docs/production-state.md) | 当前实例的非敏感部署状态、验证记录和运维说明 |
+| [多人权限策略](docs/multi-user-policy.md) | 公开用户、管理员、工具和记忆边界 |
+| [多 Guild 记忆](docs/multi-guild-memory.md) | Guild 级会话与持久记忆隔离 |
+| [Discord 权限](docs/discord-permissions.md) | Bot 所需权限与附件行为 |
+| [Discord Intent 申请](docs/discord-intent-application.md) | 特权 Intent 申请材料 |
+| [补丁栈说明](patches/README.md) | 补丁维护、升级和验证约束 |
+| [隐私政策](PRIVACY.md) | 数据处理和保留边界 |
 
-频道授权早于提及检查。按以下顺序检查：
+## 上游与许可
 
-1. 当前 Guild 是否在 `discord.allowed_guilds`。
-2. 当前频道 ID 或所属 Category ID 是否在 `discord.allowed_channels`。
-3. 普通 Guild 频道是否通过 discord.py 的 `category`/`category_id` 解析 Category。
-4. 如果消息位于 Thread，是否通过 `parent`/`parent_id` 解析父频道。
-5. 消息是否真的提及 Bot，或回复了 Bot 的消息。
-
-普通消息和 Slash Command 必须共用 Category 继承逻辑。如果频道和 Category 都未
-匹配白名单，消息会被静默拒绝；正确 `@Bot` 也不会越过这一层。相关回归位于
-`tests/gateway/test_discord_channel_controls.py`，生产状态和最近验证结果见
-[`docs/production-state.md`](docs/production-state.md)。
-
-### 补丁栈无法应用
-
-- 确认 Hermes checkout 干净且位于 `hermes-stack.lock` 指定的基础提交。
-- 先运行 `scripts/apply-hermes-patches.sh <checkout> --check`，不要直接覆盖生产文件。
-- 按锁定顺序定位首个失败补丁；不要跳过失败项继续部署。
-
-## 生产运维
-
-生产主机 `aliyun-germany` 资源有限，约有 1.6 GiB 内存和 2 GiB swap。优先在
-本地或临时 worktree 开发和验证；生产机只部署必要文件并运行定向测试。
-
-常用只读检查：
-
-```bash
-scripts/check-server.sh aliyun-germany
-ssh aliyun-germany systemctl is-active hermes-gateway.service
-ssh aliyun-germany systemctl show hermes-gateway.service \
-  -p MainPID -p NRestarts -p MemoryCurrent
-```
-
-部署时应遵守：
-
-- 先检查内存、磁盘和服务负载。
-- 备份将要覆盖的文件。
-- 只应用必要补丁并运行相关单测，避免生产机全量构建和高并发任务。
-- 所有代码和配置就绪后只重启网关一次，缩短 Discord 中断时间。
-- 重启后确认服务为 `active`、`NRestarts=0`，并查看最新短日志是否重新连接
-  Discord。
-- 永远不要输出、复制到日志或提交 `/root/.hermes/.env` 的真实内容。
-
-## 隐私
-
-ChatBird 会将用户明确触发的消息、必要上下文和支持的附件发送给配置的模型服务。
-私信不会发送给模型，但可能写入仅管理员可访问的本地日志。完整政策见
-[`PRIVACY.md`](PRIVACY.md)。
-
-## 相关文档
-
-- [`docs/production-state.md`](docs/production-state.md)：生产部署、补丁和验证状态。
-- [`docs/multi-user-policy.md`](docs/multi-user-policy.md)：权限、会话和记忆隔离策略。
-- [`docs/bird-bot-guide.md`](docs/bird-bot-guide.md)：Bot 功能参考。
-- [`docs/discord-intent-application.md`](docs/discord-intent-application.md)：Discord Intent 申请说明。
-- [`PRIVACY.md`](PRIVACY.md)：隐私政策。
+ChatBird 基于 [Hermes Agent](https://github.com/NousResearch/hermes-agent) 构建。
+使用和分发本仓库内容前，请同时遵守本仓库及上游项目的许可条款。
