@@ -1,6 +1,6 @@
 # ChatBird 生产状态与修改总览
 
-最后核对：2026-08-12（Europe/Berlin）
+最后核对：2026-08-13（Europe/Berlin）
 
 这份文档是 ChatBird 当前生产部署的非敏感总览，用于在仓库长期休眠后快速恢复上下文。它记录架构、ID 映射、安全边界、Hermes 补丁和验证方式，但不保存 API Key、Bot Token 或其他凭据。
 
@@ -162,6 +162,18 @@ Git 工作树；该脚本用于重建和升级验证，不直接覆盖生产工�
 这些差异、生产配置、策略插件和测试均以 ChatBird 仓库 `main` 为唯一长期来源；
 `codex/track-hermes-stack` 只是已合并的历史开发分支，不再承载独有内容。
 
+### 2026-08-13 Discord Category 修复
+
+频道 `1148897557947367474` 属于 Category `1146359015715110992`。用户已经正确
+`@` Bot，但旧补丁只读取 `parent`/`parent_id`；discord.py 的普通
+`TextChannel` 实际使用 `category`/`category_id`，因此 Category 没有进入频道
+白名单判断。由于该频道自身未显式列入白名单，消息在提及检查前被静默拒绝。
+
+修复后，普通 Guild 频道读取 `category`/`category_id`，Thread 读取
+`parent`/`parent_id`；普通消息和 Slash Command 使用同一继承逻辑。测试替身也改为
+模拟 discord.py 的真实字段，避免再次掩盖该问题。生产定向频道控制测试 16 项通过；
+网关重启后为 `active`、`NRestarts=0`，短日志确认已连接 Discord。
+
 ## 最近验证结果
 
 - `chatbird-policy` 本地定向测试：9 项通过。
@@ -169,9 +181,10 @@ Git 工作树；该脚本用于重建和升级验证，不直接覆盖生产工�
 - DDGS 真实搜索烟测：中文“艾克打野最新攻略”返回 3 条结果，`web_search` 已进入模型工具列表。
 - 6 个既有 Discord 会话的旧系统提示缓存已刷新；聊天历史、会话 ID 和记忆未删除，数据库 `quick_check` 为 `ok`。
 - 生产 Discord ChatBird 定向测试：10 项通过。
-- Discord Category 白名单继承回归测试：1 项通过。
+- Discord 频道控制定向测试：16 项通过，包含普通消息和 Slash Command 的 Category
+  白名单继承回归。
 - Discord API：55 个全局命令已注册，5 个公开命令均存在。
-- `hermes-gateway.service`：部署后核对为 `active`，`NRestarts=0`。
+- `hermes-gateway.service`：部署后核对为 `active`、`NRestarts=0`，短日志确认已连接 Discord。
 - Bird Gaming 频道 `1395894673792569374`：Discord API 返回 `200`。
 
 ## 安全运维

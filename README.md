@@ -1,5 +1,7 @@
 # ChatBird
 
+> 最后核对：2026-08-13（Europe/Berlin）
+
 ChatBird（小鸟聊天助手，昵称“乌鸦”）是一个面向 Discord 的多服务器 AI
 助手。项目以 [Hermes Agent](https://github.com/NousResearch/hermes-agent)
 为运行框架，通过 Xiaomi MiMo 提供模型能力，并针对公开 Discord Bot 的权限、
@@ -7,6 +9,20 @@ ChatBird（小鸟聊天助手，昵称“乌鸦”）是一个面向 Discord 的
 
 当前生产模型为 `mimo-v2.5`，由 `hermes-gateway.service` 持续运行。
 网页搜索使用无需密钥的 DDGS 后端；网页正文提取需另行配置提取后端。
+
+## 维护快速入口
+
+| 任务 | 入口 |
+|---|---|
+| 查看生产现状和 Discord ID 映射 | [`docs/production-state.md`](docs/production-state.md) |
+| 理解补丁顺序和锁定基线 | [`hermes-stack.lock`](hermes-stack.lock) |
+| 检查或应用完整 Hermes 补丁栈 | [`scripts/apply-hermes-patches.sh`](scripts/apply-hermes-patches.sh) |
+| 查看补丁维护约束 | [`patches/README.md`](patches/README.md) |
+| 只读检查生产主机 | [`scripts/check-server.sh`](scripts/check-server.sh) |
+| 查看多人权限和记忆策略 | [`docs/multi-user-policy.md`](docs/multi-user-policy.md) |
+
+新维护者应先读生产状态，再从锁定基线执行补丁栈 `--check`。不要把生产 Hermes
+工作树或 `/root/.hermes/.env` 当作长期来源；仓库 `main` 才是唯一长期来源。
 
 ## 核心能力
 
@@ -50,7 +66,7 @@ Guild/频道组合，也不得允许未列入 `allowed_guilds` 的服务器。
 | [`docs/discord-intent-application.md`](docs/discord-intent-application.md) | Discord 特权 Intent 申请说明 |
 | [`docs/bird-bot-guide.md`](docs/bird-bot-guide.md) | Bird-Bot 功能参考 |
 
-## Hermes 版本管理
+## 架构与版本管理
 
 ChatBird 不复制整份 Hermes Agent 源码，而是保存一套可重建的补丁栈：
 
@@ -163,7 +179,31 @@ Commands 默认拒绝。
    定向回归测试。
 5. 将重建文件与预期生产文件逐一比较。
 
-当前补丁栈最近一次重建验证通过 20 项相关测试，并与生产修改文件逐字节一致。
+2026-08-13 的 Category 修复验证包括：频道控制测试文件 16 项通过；完整补丁栈可从
+锁定基线执行 `--check`；重建后的 Discord adapter 和测试文件与生产文件一致。
+
+## 故障排查
+
+### 已 `@Bot`，但频道没有回复
+
+频道授权早于提及检查。按以下顺序检查：
+
+1. 当前 Guild 是否在 `discord.allowed_guilds`。
+2. 当前频道 ID 或所属 Category ID 是否在 `discord.allowed_channels`。
+3. 普通 Guild 频道是否通过 discord.py 的 `category`/`category_id` 解析 Category。
+4. 如果消息位于 Thread，是否通过 `parent`/`parent_id` 解析父频道。
+5. 消息是否真的提及 Bot，或回复了 Bot 的消息。
+
+普通消息和 Slash Command 必须共用 Category 继承逻辑。如果频道和 Category 都未
+匹配白名单，消息会被静默拒绝；正确 `@Bot` 也不会越过这一层。相关回归位于
+`tests/gateway/test_discord_channel_controls.py`，生产状态和最近验证结果见
+[`docs/production-state.md`](docs/production-state.md)。
+
+### 补丁栈无法应用
+
+- 确认 Hermes checkout 干净且位于 `hermes-stack.lock` 指定的基础提交。
+- 先运行 `scripts/apply-hermes-patches.sh <checkout> --check`，不要直接覆盖生产文件。
+- 按锁定顺序定位首个失败补丁；不要跳过失败项继续部署。
 
 ## 生产运维
 
@@ -194,3 +234,11 @@ ssh aliyun-germany systemctl show hermes-gateway.service \
 ChatBird 会将用户明确触发的消息、必要上下文和支持的附件发送给配置的模型服务。
 私信不会发送给模型，但可能写入仅管理员可访问的本地日志。完整政策见
 [`PRIVACY.md`](PRIVACY.md)。
+
+## 相关文档
+
+- [`docs/production-state.md`](docs/production-state.md)：生产部署、补丁和验证状态。
+- [`docs/multi-user-policy.md`](docs/multi-user-policy.md)：权限、会话和记忆隔离策略。
+- [`docs/bird-bot-guide.md`](docs/bird-bot-guide.md)：Bot 功能参考。
+- [`docs/discord-intent-application.md`](docs/discord-intent-application.md)：Discord Intent 申请说明。
+- [`PRIVACY.md`](PRIVACY.md)：隐私政策。

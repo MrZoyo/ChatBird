@@ -1,7 +1,50 @@
 diff --git a/plugins/platforms/discord/adapter.py b/plugins/platforms/discord/adapter.py
 --- a/plugins/platforms/discord/adapter.py
 +++ b/plugins/platforms/discord/adapter.py
-@@ -5370,11 +5370,10 @@ class DiscordAdapter(BasePlatformAdapter):
+@@ -2950,12 +2950,12 @@ class DiscordAdapter(BasePlatformAdapter):
+             channel_ids: set = set()
+             if chan_id_raw is not None:
+                 channel_ids.add(str(chan_id_raw))
+-                # Mirror on_message: also test the parent channel for threads
+-                # so per-channel allow/deny lists work consistently.
+-                if isinstance(chan_obj, discord.Thread):
+-                    parent_id = self._get_parent_channel_id(chan_obj)
+-                    if parent_id:
+-                        channel_ids.add(str(parent_id))
++                # Mirror on_message: also test a thread's parent channel or a
++                # guild channel's containing category so allow/deny lists work
++                # consistently across message and slash-command surfaces.
++                parent_id = self._get_parent_channel_id(chan_obj)
++                if parent_id:
++                    channel_ids.add(str(parent_id))
+-
++
+             allowed_raw = os.getenv("DISCORD_ALLOWED_CHANNELS", "")
+             if allowed_raw:
+@@ -5159,13 +5159,19 @@ class DiscordAdapter(BasePlatformAdapter):
+             return SendResult(success=False, error=str(e))
+-
++
+     def _get_parent_channel_id(self, channel: Any) -> Optional[str]:
+-        """Return the parent channel ID for a Discord thread-like channel, if present."""
++        """Return a thread parent or guild channel category ID, if present."""
+         parent = getattr(channel, "parent", None)
+         if parent is not None and getattr(parent, "id", None) is not None:
+             return str(parent.id)
+         parent_id = getattr(channel, "parent_id", None)
+         if parent_id is not None:
+             return str(parent_id)
++        category = getattr(channel, "category", None)
++        if category is not None and getattr(category, "id", None) is not None:
++            return str(category.id)
++        category_id = getattr(channel, "category_id", None)
++        if category_id is not None:
++            return str(category_id)
+         return None
+-
++
+     def _is_forum_parent(self, channel: Any) -> bool:
+@@ -5370,11 +5376,10 @@ class DiscordAdapter(BasePlatformAdapter):
          #   discord.auto_thread: Auto-create thread on @mention in channels (default: true)
  
          thread_id = None
@@ -27,18 +70,18 @@ diff --git a/tests/gateway/test_discord_channel_controls.py b/tests/gateway/test
 +        channel_id: int = 1,
 +        name: str = "general",
 +        guild_name: str = "Hermes Server",
-+        parent=None,
++        category=None,
 +    ):
          self.id = channel_id
          self.name = name
 -        self.guild = SimpleNamespace(name=guild_name)
-+        self.parent = parent
-+        self.parent_id = getattr(parent, "id", None)
-+        self.guild = getattr(parent, "guild", None) or SimpleNamespace(name=guild_name)
++        self.category = category
++        self.category_id = getattr(category, "id", None)
++        self.guild = getattr(category, "guild", None) or SimpleNamespace(name=guild_name)
          self.topic = None
  
  
-@@ -100,6 +108,31 @@ def make_message(*, channel, content: str, mentions=None):
+@@ -100,6 +108,55 @@ def make_message(*, channel, content: str, mentions=None):
      )
  
  
@@ -58,13 +101,37 @@ diff --git a/tests/gateway/test_discord_channel_controls.py b/tests/gateway/test
 +    category = SimpleNamespace(id=500)
 +    bot_user = adapter._client.user
 +    message = make_message(
-+        channel=FakeTextChannel(channel_id=501, parent=category),
++        channel=FakeTextChannel(channel_id=501, category=category),
 +        content=f"<@{bot_user.id}> hello",
 +        mentions=[bot_user],
 +    )
 +    await adapter._handle_message(message)
 +
 +    adapter.handle_message.assert_awaited_once()
++
++
++@pytest.mark.asyncio
++async def test_allowed_category_authorizes_child_channel_slash_command(adapter, monkeypatch):
++    """Slash commands inherit allowed_channels membership from their category."""
++    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "500")
++    monkeypatch.delenv("DISCORD_IGNORED_CHANNELS", raising=False)
++    monkeypatch.delenv("CHATBIRD_ADMIN_USERS", raising=False)
++    monkeypatch.delenv("CHATBIRD_ADMIN_CHANNELS", raising=False)
++
++    category = SimpleNamespace(id=500)
++    channel = FakeTextChannel(channel_id=501, category=category)
++    interaction = SimpleNamespace(
++        channel_id=channel.id,
++        channel=channel,
++        guild=SimpleNamespace(id=600),
++        guild_id=600,
++        user=SimpleNamespace(id=42, roles=[]),
++    )
++
++    allowed, reason = adapter._evaluate_slash_authorization(interaction, "/status")
++
++    assert allowed is True
++    assert reason is None
 +
 +
  # ── ignored_channels ─────────────────────────────────────────────────
