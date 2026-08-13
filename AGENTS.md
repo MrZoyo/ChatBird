@@ -22,3 +22,14 @@
   boundaries. Include `guild_id` in every Discord session and memory scope.
 - Production deployments must configure `discord.allowed_guilds`; guilds that
   are absent from that allowlist must be denied.
+
+## Git Workflow
+
+- After the requested changes pass focused validation, commit and push them
+  directly to `main` by default.
+- Do not create a feature branch or pull request unless the user explicitly
+  asks for one, repository protection prevents a direct push, or the change
+  still needs review before it is safe to merge.
+- If a temporary branch or pull request was created unnecessarily, merge the
+  validated commit into `main`, push `main`, close the pull request, and delete
+  the temporary branch.
