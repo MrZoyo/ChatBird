@@ -61,6 +61,13 @@ _PROFILE_CATEGORIES = frozenset(
     {"preference", "trait", "communication_style", "stable_context"}
 )
 
+_BUILTIN_PROFILE_ENABLE_RE = re.compile(
+    r"(?is)user_profile_enabled.{0,80}(?:\btrue\b|\byes\b|\bon\b|(?<!\d)1(?!\d))"
+)
+_PROFILE_GUARDED_WRITE_TOOLS = frozenset(
+    {"apply_patch", "execute_code", "patch", "skill_manage", "terminal", "write_file"}
+)
+
 _WEB_RESEARCH_POLICY = """[Trusted ChatBird web research policy]
 Treat web_search and web_extract as the canonical end-to-end retrieval interface.
 When asked whether a site can be searched, read, or used after a browser change,
@@ -397,7 +404,11 @@ def _on_pre_llm_call(user_message: str = "", platform: str = "", **_: Any) -> di
             "and administrator channel ID. Administrator tools are allowed. Sensitive "
             "results and administrator memory must remain in this channel. The built-in "
             "memory tool manages the current guild's public memory; chatbird_memory manages "
-            "administrator memory and user profiles."
+            "administrator memory and user profiles. ChatBird user profiles are already "
+            "enabled through chatbird_memory and are isolated by Discord guild ID and user "
+            "ID. Hermes memory.user_profile_enabled controls the built-in shared USER.md, "
+            "not ChatBird profiles; it must remain false. Never edit that setting to enable "
+            "profiles and never claim a restart is required merely to enable ChatBird profiles."
         )
         if home_channel:
             policy += (
@@ -451,7 +462,11 @@ def _on_pre_llm_call(user_message: str = "", platform: str = "", **_: Any) -> di
     return {"context": "\n\n".join(parts)}
 
 
-def _on_pre_tool_call(tool_name: str = "", **_: Any) -> dict[str, str] | None:
+def _on_pre_tool_call(
+    tool_name: str = "",
+    args: Any = None,
+    **_: Any,
+) -> dict[str, str] | None:
     ctx = _context()
     try:
         from tools.skill_provenance import is_background_review
@@ -459,6 +474,21 @@ def _on_pre_tool_call(tool_name: str = "", **_: Any) -> dict[str, str] | None:
         background_review = is_background_review()
     except Exception:
         background_review = False
+
+    if tool_name in _PROFILE_GUARDED_WRITE_TOOLS:
+        try:
+            rendered_args = json.dumps(args, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            rendered_args = str(args)
+        if _BUILTIN_PROFILE_ENABLE_RE.search(rendered_args):
+            return {
+                "action": "block",
+                "message": (
+                    "ChatBird blocked an attempt to enable Hermes's shared USER.md. "
+                    "Per-user profiles are already provided by chatbird_memory and isolated "
+                    "by Discord guild and user; memory.user_profile_enabled must remain false."
+                ),
+            }
 
     # A Discord-origin background operation must retain its full identity.
     # Missing identity is never an implicit promotion to CLI/admin access.

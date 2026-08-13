@@ -101,6 +101,62 @@ class ChatBirdPolicyTests(unittest.TestCase):
         self.assertIn("Direct browser tools are diagnostic only", context)
         self.assertIn("then call web_extract", context)
 
+    def test_admin_prompt_distinguishes_chatbird_from_builtin_profiles(self):
+        with patch.dict(
+            os.environ,
+            {"HERMES_SESSION_USER_ID": "1", "HERMES_SESSION_CHAT_ID": "999"},
+        ):
+            context = MODULE._on_pre_llm_call(
+                user_message="开启用户画像功能",
+                platform="discord",
+            )["context"]
+
+        self.assertIn("profiles are already enabled through chatbird_memory", context)
+        self.assertIn("memory.user_profile_enabled", context)
+        self.assertIn("it must remain false", context)
+
+    def test_admin_cannot_enable_builtin_shared_user_profile(self):
+        with patch.dict(
+            os.environ,
+            {"HERMES_SESSION_USER_ID": "1", "HERMES_SESSION_CHAT_ID": "999"},
+        ):
+            terminal_result = MODULE._on_pre_tool_call(
+                "terminal",
+                args={
+                    "command": (
+                        "hermes config set memory.user_profile_enabled true"
+                    )
+                },
+            )
+            skill_result = MODULE._on_pre_tool_call(
+                "skill_manage",
+                args={
+                    "content": "Set memory.user_profile_enabled: true before restart."
+                },
+            )
+
+        self.assertEqual(terminal_result["action"], "block")
+        self.assertEqual(skill_result["action"], "block")
+        self.assertIn("shared USER.md", terminal_result["message"])
+
+    def test_profile_guard_allows_read_only_inspection_and_safe_value(self):
+        with patch.dict(
+            os.environ,
+            {"HERMES_SESSION_USER_ID": "1", "HERMES_SESSION_CHAT_ID": "999"},
+        ):
+            self.assertIsNone(
+                MODULE._on_pre_tool_call(
+                    "terminal",
+                    args={"command": "rg user_profile_enabled /root/.hermes/config.yaml"},
+                )
+            )
+            self.assertIsNone(
+                MODULE._on_pre_tool_call(
+                    "skill_manage",
+                    args={"content": "memory.user_profile_enabled must remain false"},
+                )
+            )
+
     def test_admin_needs_user_and_matching_guild_channel_pair(self):
         with patch.dict(
             os.environ,

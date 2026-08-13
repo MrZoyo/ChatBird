@@ -104,6 +104,24 @@ cp .env.example /path/to/hermes/.env
 - 保持 `group_sessions_per_user: false` 和 `memory.user_profile_enabled: false`，
   以使用 ChatBird 的共享频道会话与分层记忆策略。
 
+`memory.user_profile_enabled` 控制 Hermes 内建的共享 `USER.md`，不是 ChatBird 用户
+画像。ChatBird 已通过 `chatbird-policy` 的 `chatbird_memory` 提供用户画像，并按
+`guild_id + user_id` 隔离；不要开启 Hermes 的共享开关。
+
+Linux systemd 部署还应安装生产配置守卫：
+
+```bash
+install -m 0700 scripts/validate-production-config.py \
+  /root/.hermes/chatbird/validate-production-config.py
+install -D -m 0644 \
+  deploy/systemd/hermes-gateway.service.d/chatbird-config-guard.conf \
+  /etc/systemd/system/hermes-gateway.service.d/chatbird-config-guard.conf
+systemctl daemon-reload
+```
+
+守卫会在每次启动前恢复错误开启的共享画像开关，并拒绝缺少 Guild 白名单、使用
+通配符白名单或未启用 `chatbird-policy` 的配置。
+
 示例中的 ID 和凭据均为占位内容。真实密钥只应保存在部署环境中，不得提交到 Git。
 
 ### 4. 配置 Discord 应用
@@ -192,6 +210,9 @@ ChatBird 保留完整的 Hermes 上游历史，只跟踪经过审阅的差异。
 | [`patches/`](patches/) | Hermes 补丁、参考配置和补丁说明 |
 | [`plugins/chatbird-policy/`](plugins/chatbird-policy/) | 请求级权限与分层记忆策略插件 |
 | [`scripts/apply-hermes-patches.sh`](scripts/apply-hermes-patches.sh) | 检查或应用完整补丁栈 |
+| [`scripts/validate-production-config.py`](scripts/validate-production-config.py) | 校验并保护生产配置的多 Guild 隔离约束 |
+| [`skills/discord-admin/chatbird-admin/`](skills/discord-admin/chatbird-admin/) | ChatBird 管理操作的部署 Skill |
+| [`deploy/systemd/`](deploy/systemd/) | systemd 服务附加配置 |
 | [`config.example.yaml`](config.example.yaml) | 不含凭据的行为配置示例 |
 | [`.env.example`](.env.example) | 环境变量占位示例 |
 | [`docs/`](docs/) | 权限、隔离、隐私和运维文档 |

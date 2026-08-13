@@ -22,7 +22,9 @@ session. Different channels remain separate, and every key retains the Guild
 suffix. Channels inside the same Guild share public `MEMORY.md`; personal
 profiles and administrator memory use the additional paths documented in
 [`multi-user-policy.md`](multi-user-policy.md). ChatBird disables the built-in
-shared `USER.md` so personal facts cannot mix between members.
+shared `USER.md` so personal facts cannot mix between members. The
+`memory.user_profile_enabled` setting must therefore remain `false`; ChatBird
+profiles are already active through `chatbird-policy` and `chatbird_memory`.
 
 ## Adding a Discord Server
 
@@ -32,9 +34,12 @@ shared `USER.md` so personal facts cannot mix between members.
    An empty or omitted channel list allows every channel the bot can view.
 3. Keep `require_mention: true`, `auto_thread: false`, and
    `group_sessions_per_user: false` for the shared-channel UX.
-4. Restart `hermes-gateway.service` and check that it remains active with no
+4. Run `scripts/validate-production-config.py` against the deployed
+   `config.yaml` and install the systemd drop-in from
+   `deploy/systemd/hermes-gateway.service.d/`.
+5. Restart `hermes-gateway.service` and check that it remains active with no
    restart loop.
-5. Mention the bot once in the new server. Hermes creates that Guild's public
+6. Mention the bot once in the new server. Hermes creates that Guild's public
    memory directory lazily; user profiles are also created lazily.
 
 An invited server that is absent from `allowed_guilds` is ignored. Do not use
@@ -64,6 +69,15 @@ The test channel allowlist change was captured afterward in
 Focused verification on 2026-08-11 passed 8 isolation tests and 131 directly
 related regression tests. The full Hermes suite was intentionally not run on
 the production host.
+
+On 2026-08-13, an administrator request exposed a configuration ambiguity:
+Hermes treated `memory.user_profile_enabled` as ChatBird's profile switch and
+changed it to `true`. The running gateway had loaded the prior safe value, so
+the shared `USER.md` never became active. ChatBird restored the setting to
+`false`, upgraded `chatbird-policy` to `1.3.2`, corrected the persistent
+`chatbird-admin` Skill, and installed a systemd startup guard. The guard now
+repairs this one unsafe value and fails closed if the Guild allowlist or policy
+plugin invariant is missing.
 
 ## Small-Server Limits
 

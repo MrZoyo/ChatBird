@@ -109,6 +109,27 @@ At minimum:
   `memory.user_profile_enabled: false` to use ChatBird's shared-channel and
   layered-memory policy.
 
+`memory.user_profile_enabled` controls Hermes's built-in shared `USER.md`; it
+does not enable ChatBird profiles. ChatBird already provides user profiles
+through the `chatbird-policy` plugin's `chatbird_memory` tool and isolates them
+by `guild_id + user_id`. Do not enable the shared Hermes setting.
+
+Linux systemd deployments should also install the production configuration
+guard:
+
+```bash
+install -m 0700 scripts/validate-production-config.py \
+  /root/.hermes/chatbird/validate-production-config.py
+install -D -m 0644 \
+  deploy/systemd/hermes-gateway.service.d/chatbird-config-guard.conf \
+  /etc/systemd/system/hermes-gateway.service.d/chatbird-config-guard.conf
+systemctl daemon-reload
+```
+
+Before every start, the guard restores an accidentally enabled shared profile
+setting and rejects configurations that omit the guild allowlist, use its
+wildcard, or disable `chatbird-policy`.
+
 All IDs and credentials in the examples are placeholders. Keep real secrets in
 the deployment environment and never commit them.
 
@@ -214,6 +235,9 @@ maintaining a long-lived source-code fork.
 | [`patches/`](patches/) | Hermes patches, reference configuration, and patch notes |
 | [`plugins/chatbird-policy/`](plugins/chatbird-policy/) | Request-scoped access and layered-memory policy plugin |
 | [`scripts/apply-hermes-patches.sh`](scripts/apply-hermes-patches.sh) | Checks or applies the complete patch stack |
+| [`scripts/validate-production-config.py`](scripts/validate-production-config.py) | Validates and protects production multi-guild invariants |
+| [`skills/discord-admin/chatbird-admin/`](skills/discord-admin/chatbird-admin/) | Deployment Skill for ChatBird administration |
+| [`deploy/systemd/`](deploy/systemd/) | systemd service drop-ins |
 | [`config.example.yaml`](config.example.yaml) | Sanitized behavior configuration example |
 | [`.env.example`](.env.example) | Environment-variable placeholders |
 | [`docs/`](docs/) | Access, isolation, privacy, and operations documentation |

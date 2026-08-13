@@ -119,12 +119,17 @@ keeps only HSGuru result URLs and never retries an explicit rate limit.
 | User profile | `memories/chatbird/profiles/discord-guild-<guild_id>/<user_id>.md` | Injected only for that user; an admin can inspect it |
 | Admin memory | `memories/chatbird/admin/discord-guild-<guild_id>/ADMIN.md` | Injected and writable only in an admin context |
 
-The shared Hermes `USER.md` remains disabled. A normal user cannot directly
-command a profile-memory change. The Agent may proactively retain only a
-bounded stable preference, trait, communication style, or durable personal
-context. The profile tool rejects direct “remember/forget” requests, task
-history, completed-work records, instruction-like text, credential-like text,
-and prompt-injection patterns.
+The shared Hermes `USER.md` remains disabled. Its
+`memory.user_profile_enabled` setting is not the ChatBird profile switch and
+must remain `false`. ChatBird profiles are already active through
+`chatbird_memory`. The policy plugin blocks administrator and background Skill
+attempts to enable the shared setting.
+
+A normal user cannot directly command a profile-memory change. The Agent may
+proactively retain only a bounded stable preference, trait, communication
+style, or durable personal context. The profile tool rejects direct
+“remember/forget” requests, task history, completed-work records,
+instruction-like text, credential-like text, and prompt-injection patterns.
 
 ## Direct Messages
 

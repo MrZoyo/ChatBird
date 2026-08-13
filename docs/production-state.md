@@ -1,6 +1,6 @@
 # ChatBird 生产状态与修改总览
 
-最后核对：2026-08-13（Europe/Berlin）
+最后核对：2026-08-14（Europe/Berlin）
 
 这份文档是 ChatBird 当前生产部署的非敏感总览，用于在仓库长期休眠后快速恢复上下文。它记录架构、ID 映射、安全边界、Hermes 补丁和验证方式，但不保存 API Key、Bot Token 或其他凭据。
 
@@ -15,7 +15,7 @@
 | ChatBird 身份提示词 | `/root/.hermes/SOUL.md` |
 | systemd 服务 | `hermes-gateway.service` |
 | 模型 | Xiaomi MiMo `mimo-v2.5` |
-| 策略插件 | `chatbird-policy` `1.3.1` |
+| 策略插件 | `chatbird-policy` `1.3.2` |
 
 生产机只有约 1.6 GiB 内存。只能做定向读取、单文件测试和短日志检查；不要在生产机运行全仓扫描、完整测试套件、高并发构建或无必要升级。不要打印、复制到日志或提交 `/root/.hermes/.env` 的实际值。
 
@@ -79,6 +79,16 @@
 | 管理员记忆 | `memories/chatbird/admin/discord-guild-<guild_id>/ADMIN.md` | 只在当前 Guild 的管理员上下文中注入和写入 |
 
 普通用户不能命令 Agent “记住”或“忘记”某件事。Agent 只能主动保留稳定的偏好、特点、交流风格或长期背景；任务指令、完成记录、凭据、提示注入和短期状态不能进入用户档案。
+
+`memory.user_profile_enabled` 必须保持 `false`。该开关控制 Hermes 内建的共享
+`USER.md`，不是 ChatBird 用户画像。ChatBird 的画像功能由 `chatbird-policy` 和
+`chatbird_memory` 提供，并按 `guild_id + user_id` 隔离。systemd 在每次启动 Hermes
+前运行 `validate-production-config.py`：它会自动把这一开关恢复为 `false`，并在
+`discord.allowed_guilds` 缺失、包含通配符或策略插件未启用时拒绝启动。
+
+2026-08-13，Hermes 曾把该开关误解为 ChatBird 画像开关并写成 `true`。当时运行中
+的 Gateway 仍使用修改前的安全配置，因此共享 `USER.md` 从未生效。修复已恢复
+`false`、更正持久化的 `chatbird-admin` Skill、升级策略插件并安装上述启动守卫。
 
 Hermes 的 `/memory` 命令管理“写入审批队列”，不是查看已有记忆：
 
