@@ -1,6 +1,6 @@
 # ChatBird 生产状态与修改总览
 
-最后核对：2026-08-14（Europe/Berlin）
+模型与服务状态最后核对：2026-09-22（Europe/Berlin）。其他功能的历史验证日期见各节。
 
 这份文档是 ChatBird 当前生产部署的非敏感总览，用于在仓库长期休眠后快速恢复上下文。它记录架构、ID 映射、安全边界、Hermes 补丁和验证方式，但不保存 API Key、Bot Token 或其他凭据。
 
@@ -14,12 +14,70 @@
 | Hermes 环境变量 | `/root/.hermes/.env`，权限应为 `0600` |
 | ChatBird 身份提示词 | `/root/.hermes/SOUL.md` |
 | systemd 服务 | `hermes-gateway.service` |
-| 模型 | Xiaomi MiMo `mimo-v2.5` |
+| 模型 | Xiaomi MiMo `mimo-v2.6-pro`（主模型、文本辅助任务和图片分析） |
 | 策略插件 | `chatbird-policy` `1.3.2` |
 
 生产机只有约 1.6 GiB 内存。只能做定向读取、单文件测试和短日志检查；不要在生产机运行全仓扫描、完整测试套件、高并发构建或无必要升级。不要打印、复制到日志或提交 `/root/.hermes/.env` 的实际值。
 
 本地非敏感配置镜像是 [`../patches/chatbird-production-config.yaml`](../patches/chatbird-production-config.yaml)，环境变量格式参考 [`../.env.example`](../.env.example)。
+
+### 2026-09-22 MiMo V2.6 Pro 切换
+
+Mac 已通过现有 `aliyun-germany` SSH 配置连接生产机。切换前服务为
+`active/running`、`NRestarts=0`；可用内存约 875 MiB，根分区剩余约 20 GiB。
+生产原模型实际为 `mimo-v2.5`，不是 `mimo-v2.5-pro`。
+
+新模型使用官方标识 [`mimo-v2.6-pro`](https://mimo.mi.com/models/zh-CN/mimo-v2.6-pro)，
+继续通过 Xiaomi 的 `https://api.xiaomimimo.com/v1` 和原有生产凭据调用。
+只修改模型配置，未升级 Hermes 或依赖：
+
+```yaml
+model:
+  provider: xiaomi
+  default: mimo-v2.6-pro
+
+auxiliary:
+  vision:
+    provider: xiaomi
+    model: mimo-v2.6-pro
+```
+
+使用 `model.default` 是因为当前 Hermes 的辅助客户端读取该字段；旧的
+`model.model` 虽能被 Gateway 识别，却不能被所有辅助任务读取。
+图片分析需单独指定，避免当前 Hermes 的 Xiaomi 视觉默认值继续选择 `mimo-v2.5`。
+已验证上下文长度自动识别为 1,048,576 tokens，无需增加覆盖值。
+
+生产配置在原文件上定向修改，并按 YAML 结构比较确认其他设置完全不变，包含
+两个 Guild、10 个频道/Category 白名单、策略插件和记忆隔离设置。本地配置镜像
+保留原有示例白名单，不应整份覆盖生产配置。API Key、Bot Token、会话和持久记忆
+均未修改。
+
+验证结果：
+
+- 本地生产配置守卫和其 4 项单元测试通过。
+- 切换前，现有生产凭据可列出并调用 V2.6 Pro；文本请求和带推理内容回传的
+  合成工具调用完整往返通过。
+- 切换后，经 Hermes 客户端解析的流式文本返回 `MIMO_STREAM_OK`，图片分析将
+  合成纯红 PNG 识别为 `RED`；两次响应的模型均为 `mimo-v2.6-pro`。
+- 文本压缩、网页提取、标题生成和后台审阅的客户端均解析为 `mimo-v2.6-pro`。
+  此项验证客户端选型，未逐项运行对应完整业务流程。
+- 网关于 19:05:13 CEST 重启，新进程 PID 为 `529347`，19:05:23 确认 Discord
+  已连接。服务为 `active/running`、`NRestarts=0`，启动配置守卫通过。
+- Discord Bot 身份接口及两个允许 Guild 的接口均返回 HTTP 200。
+- 旧日志中的 Discord 503 重连异常在切换前最近半小时没有重现。重启时旧进程
+  收到 SIGTERM 后以状态 1 退出；新进程正常启动并连接，未发生自动重启。
+
+本次未代用户在 Discord 发送消息，因此未声称完成 Discord 用户侧的实际对话验收。
+
+切换前配置备份（仅生产机，权限 `0600`）：
+`/root/.hermes/backups/mimo-v2.6-pro-20260922T170502Z/config.yaml`。
+回退时先确认此后是否有其他配置修改，再恢复对应模型设置并重启网关；不要覆盖
+后续白名单或其他运维变更。
+
+配置 SHA-256：
+
+- 切换前：`6378b12c49b5ee6aa4b72ace2f19e48dab4f61219995d9839db571d20439648a`
+- 切换后：`192f8952151282ead3f1c51c11d3634de7476f6d28a291ba340d59a5b7885746`
 
 ## Discord ID 映射
 
