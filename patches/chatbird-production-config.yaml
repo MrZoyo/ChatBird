@@ -50,7 +50,7 @@ discord:
     - "1154706638901612625" # Bird Gaming administrator channel
     - "1220876330913234944" # 秘密研究 administrator channel
   history_backfill: true
-  history_backfill_limit: 50
+  history_backfill_limit: 200
   allowed_guilds:
     - "1146359014968537089"
     - "921407984586866778"

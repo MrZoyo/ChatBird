@@ -227,7 +227,14 @@ auxiliary:
 - `group_sessions_per_user: false`，不会按频道内用户拆分会话。
 - `auto_thread: false`，回复留在原频道，不自动创建讨论串。
 - Guild 频道（包括语音频道内置文字聊天）需要明确提及 Bot；讨论串也需要提及。
-- 最近历史回填开启，最多读取 50 条可见消息作为有界上下文。
+- 最近历史回填开启，按需抓取：只在 Bot 被提及时，从触发消息向前读取最多 200 条
+  Discord 消息（2026-10-11 由 50 调整，备份为
+  `/root/.hermes/backups/backfill-200-20261011T203630Z/config.yaml`）。读取遇到 Bot
+  自己上一条对话回复即停止，因为更早内容已在会话记录中；系统消息、空消息和其他
+  Bot 的消息被过滤，纯附件只显示为 `(attachment)`，Bot 处理期间的新消息不会补抓。
+  用户通过 Discord“回复”指向更早消息时，另外读取该消息及其之前最多 10 条。
+- 会话按 Hermes 默认策略重置：每天 04:00（服务器时区 Asia/Shanghai）或闲置 24 小时，
+  以先到者为准。重置后，Bot 上一条回复之前的内容既不在会话中，也不会被回填。
 - 未列入 `discord.allowed_guilds` 的服务器 fail closed，即使公开 Bot 被邀请进去也不能使用 Agent。
 
 ## 用户与管理员权限

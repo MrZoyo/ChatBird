@@ -13,7 +13,7 @@ discord:
   require_mention: true
   auto_thread: false
   history_backfill: true
-  history_backfill_limit: 50
+  history_backfill_limit: 200
 ```
 
 The bot replies inline only when mentioned. Messages posted between two bot
