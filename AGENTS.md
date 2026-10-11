@@ -33,3 +33,7 @@
 - If a temporary branch or pull request was created unnecessarily, merge the
   validated commit into `main`, push `main`, close the pull request, and delete
   the temporary branch.
+
+## Local Development
+
+See `docs/local-development.md` for the macOS/Linux test environment and patch-stack checks.

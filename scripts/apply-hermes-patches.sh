@@ -38,8 +38,15 @@ fi
 
 base_commit=$(awk '$1 == "base_commit" { print $2; exit }' "$lock_file")
 upstream_repo=$(awk '$1 == "upstream_repo" { print $2; exit }' "$lock_file")
-mapfile -t patch_files < <(awk '$1 == "patch" { print $2 }' "$lock_file")
-mapfile -t overlay_files < <(awk '$1 == "overlay" { print $2 "\t" $3 }' "$lock_file")
+# macOS ships Bash 3.2, which does not provide mapfile.
+patch_files=()
+while IFS= read -r patch_rel; do
+    patch_files+=("$patch_rel")
+done < <(awk '$1 == "patch" { print $2 }' "$lock_file")
+overlay_files=()
+while IFS= read -r overlay_row; do
+    overlay_files+=("$overlay_row")
+done < <(awk '$1 == "overlay" { print $2 "\t" $3 }' "$lock_file")
 
 if [[ -z $base_commit || -z $upstream_repo || ${#patch_files[@]} -eq 0 ]]; then
     echo "Invalid Hermes lock file: $lock_file" >&2
@@ -122,7 +129,8 @@ for overlay_row in "${overlay_files[@]}"; do
             echo "Overlay target already exists: $target_file" >&2
             exit 1
         fi
-        install -D -m 0644 "$source_file" "$target_file"
+        mkdir -p "$(dirname -- "$target_file")"
+        install -m 0644 "$source_file" "$target_file"
     fi
 done
 

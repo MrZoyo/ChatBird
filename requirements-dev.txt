@@ -1,0 +1,3 @@
+# Dependencies for the standalone tests/ suite and config guard.
+# The Hermes runtime is maintained in its own checkout.
+PyYAML==6.0.2
