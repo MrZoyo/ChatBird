@@ -245,6 +245,18 @@ auxiliary:
 
 两个炉石站点采用不同的合规路径。HSGuru 的页面在本机数据中心 IP 下仍返回 Cloudflare challenge，且其公开 `robots.txt` 明确禁止自动访问 `/api`、`/decks` 和带查询参数的统计页；Hermes 因此只通过 DDGS 的公开索引检索 HSGuru 页面与摘要，不逆向或绕过这些接口。查询明确提到 HSGuru、但普通结果没有 HSGuru 链接时，Hermes 最多查询 Yahoo 的 Meta/Decks 与全站两个公开索引，并过滤掉非 HSGuru 结果；明确限流不重试。Vicious Syndicate 的本地浏览器、WordPress API、RSS 和站点地图同样被 challenge 拦截，但 Jina Reader 能返回公开文章正文；即使本地 Chromium requirements 不满足，Reader 仍独立尝试。生产只把精确域名 `www.vicioussyndicate.com` 的无查询参数公开页面交给该只读后端，并复核返回源域名和挑战页标记。
 
+Discord 帮助中心 `support.discord.com` 由 Zendesk 提供，其文章页对所有非浏览器
+客户端返回 Cloudflare 挑战（HTTP 403，`cf-mitigated: challenge`），机房 IP 和家庭
+宽带都一样，生产的本地 Chromium 也无法通过；这不是网络封锁，`discord.com` 的其他页面
+均返回 200。其 robots 规则允许文章页和文章 API，只禁止访问统计端点。2026-10-11 起，
+`web_extract` 主提取失败后，`web.browser_fallback.zendesk_article_api_hosts` 中精确
+列出的主机的文章 URL（`/hc/<locale>/articles/<id>`）改为在启动 Chromium 前读取公开的
+Help Center 文章 API。请求沿用 simple-http 的公网、重定向和大小限制，要求同主机、
+文章 ID 一致且非草稿，不转发查询参数。生产按真实配置端到端调用 `web_extract` 读取
+Age-Restricted Channels 文章：3.9 秒返回 2,746 字符正文，没有启动浏览器。部署前
+备份位于 `/root/.hermes/backups/help-center-api-20261011T211937Z/`；网关于
+23:20:50 CEST 重启，新 PID 为 `636982`，Discord 已连接，`NRestarts=0`。
+
 所有 Discord 回合都会收到网页能力验收规则，包括管理员频道：必须先测试正式 `web_search`/`web_extract` 入口。直接浏览器只作为单一路径诊断；其 Cloudflare challenge 不能被表述成完整检索链失败。`gaming-references` Skill 同样按此口径维护，并分别要求 HSGuru 使用自然语言搜索、Vicious Syndicate 使用搜索定位后的正文提取。
 
 公开频道触发的后台自我改进可以提议新建公开 Skill，或更新已经公开审批的 Skill；改动必须先进入候选目录，经过静态惰性内容校验，再由一个无工具、无记忆的独立 Agent 审批。拒绝、超时、输出格式错误、身份丢失或策略异常都 fail closed，并保留旧版本。公开后台任务不能修改未审批/私有 Skill，也不能删除 Skill。
@@ -347,6 +359,7 @@ Git 工作树；该脚本用于重建和升级验证，不直接覆盖生产工�
 | [`../patches/hermes-public-skills-web-extract.patch`](../patches/hermes-public-skills-web-extract.patch) | 公开 Skill 哈希审批、自我改进二次审批与无密钥静态网页提取 |
 | [`../patches/hermes-web-browser-fallback.patch`](../patches/hermes-web-browser-fallback.patch) | `web_search`/`web_extract` 内部受限浏览器回退，不扩大公开工具权限 |
 | [`../patches/hermes-anthropic-user-api-key.patch`](../patches/hermes-anthropic-user-api-key.patch) | `sk-ant-usr-*` Anthropic API Key 走 `x-api-key`，不套用 Claude Code OAuth 身份转换 |
+| [`../patches/hermes-help-center-article-api.patch`](../patches/hermes-help-center-article-api.patch) | 白名单 Zendesk 帮助中心文章在浏览器回退前改读公开文章 API |
 | [`../patches/hermes-gateway-browser.conf`](../patches/hermes-gateway-browser.conf) | Hermes 服务的本地 Chromium 可执行文件位置 |
 | [`../plugins/chatbird-policy/`](../plugins/chatbird-policy/) | 请求级工具权限、管理员上下文与分层记忆 |
 | [`../patches/hermes-tests/test_discord_chatbird_access.py`](../patches/hermes-tests/test_discord_chatbird_access.py) | 生产 Hermes Discord 定向回归测试 |
@@ -367,7 +380,8 @@ Git 工作树；该脚本用于重建和升级验证，不直接覆盖生产工�
 - `hermes-discord-category-channel-allowlist.patch`
 - `hermes-skill-policy-exception.patch`
 
-2026-10-11 起，生产工作树另外应用 `hermes-anthropic-user-api-key.patch`。
+2026-10-11 起，生产工作树另外应用 `hermes-anthropic-user-api-key.patch` 和
+`hermes-help-center-article-api.patch`。
 
 这些差异、生产配置、策略插件和测试均以 ChatBird 仓库 `main` 为唯一长期来源；
 `codex/track-hermes-stack` 只是已合并的历史开发分支，不再承载独有内容。

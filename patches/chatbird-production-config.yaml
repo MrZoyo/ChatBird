@@ -32,6 +32,10 @@ web:
     reader_allowed_hosts:
       - www.vicioussyndicate.com
     reader_timeout_seconds: 20
+    # Zendesk Help Center article pages that challenge non-browser clients
+    # are read from the public Help Center article API before Chromium.
+    zendesk_article_api_hosts:
+      - support.discord.com
 
 browser:
   cloud_provider: local

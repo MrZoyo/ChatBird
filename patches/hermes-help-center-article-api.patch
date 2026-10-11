@@ -1,0 +1,171 @@
+diff --git a/tools/web_browser_fallback.py b/tools/web_browser_fallback.py
+index 9bd00325..ff8cea2d 100644
+--- a/tools/web_browser_fallback.py
++++ b/tools/web_browser_fallback.py
+@@ -9,6 +9,7 @@ then closes the session.  Public callers continue to invoke only
+ 
+ from __future__ import annotations
+ 
++import http.client
+ import json
+ import logging
+ import re
+@@ -69,6 +70,13 @@ _RETRYABLE_ERROR_MARKERS = (
+     "timed out",
+     "timeout",
+ )
++# Zendesk Help Center article pages: /hc/<locale>/articles/<id>-<slug>.  The
++# locale segment is optional; Zendesk redirects locale-less URLs to a default.
++_ZENDESK_ARTICLE_PATH = re.compile(
++    r"^/hc/(?:(?P<locale>[a-z]{2,3}(?:-[a-z0-9]{2,8})?)/)?"
++    r"articles/(?P<id>\d{1,20})(?:-[^/]*)?/?$",
++    re.IGNORECASE,
++)
+ _NON_RETRYABLE_ERROR_MARKERS = (
+     "blocked:",
+     "http 429",
+@@ -193,7 +201,11 @@ def _safe_public_url(url: str) -> bool:
+ 
+ def _configured_reader_hosts(config: Dict[str, Any]) -> set[str]:
+     """Return the explicit host allowlist for the optional read-only service."""
+-    raw = config.get("reader_allowed_hosts", [])
++    return _configured_hosts(config, "reader_allowed_hosts")
++
++
++def _configured_hosts(config: Dict[str, Any], key: str) -> set[str]:
++    raw = config.get(key, [])
+     if isinstance(raw, str):
+         raw = [part.strip() for part in raw.split(",")]
+     if not isinstance(raw, (list, tuple, set)):
+@@ -213,6 +225,95 @@ def _reader_host_allowed(url: str, config: Dict[str, Any]) -> bool:
+     return bool(host and host in _configured_reader_hosts(config))
+ 
+ 
++def _zendesk_article_api_url(
++    url: str, config: Dict[str, Any]
++) -> Optional[tuple[str, str]]:
++    """Map an allowlisted Help Center article page to its public JSON API.
++
++    Returns ``(api_url, article_id)`` or None.  Only exact allowlisted HTTPS
++    hosts and article paths qualify; query strings are never forwarded.
++    """
++    try:
++        parsed = urllib.parse.urlsplit(normalize_url_for_request(url))
++        port = parsed.port
++    except ValueError:
++        return None
++    host = (parsed.hostname or "").lower().rstrip(".")
++    if (
++        parsed.scheme.lower() != "https"
++        or parsed.username
++        or parsed.password
++        or port not in (None, 443)
++        or host not in _configured_hosts(config, "zendesk_article_api_hosts")
++    ):
++        return None
++    match = _ZENDESK_ARTICLE_PATH.match(parsed.path)
++    if not match:
++        return None
++    locale = (match.group("locale") or "").lower()
++    prefix = f"/api/v2/help_center/{locale}" if locale else "/api/v2/help_center"
++    article_id = match.group("id")
++    return f"https://{host}{prefix}/articles/{article_id}.json", article_id
++
++
++def _zendesk_article_extract(
++    url: str, *, min_chars: int, max_chars: int
++) -> tuple[Optional[Dict[str, str]], Optional[str]]:
++    """Read one allowlisted Zendesk Help Center article through its public API.
++
++    Some Help Centers put article pages behind a JavaScript challenge while the
++    documented, unauthenticated Help Center API serves the same published
++    article.  The request goes through the guarded simple-http fetcher, so
++    public-address pinning, redirect checks and size limits still apply.
++    """
++    config = _fallback_config()
++    mapped = _zendesk_article_api_url(url, config)
++    if mapped is None:
++        return None, "URL is not an allowlisted Help Center article"
++    api_url, article_id = mapped
++    if not _safe_public_url(api_url):
++        return None, "Help Center API URL is not allowed"
++    host = (urllib.parse.urlsplit(api_url).hostname or "").lower()
++
++    from plugins.web.simple_http.provider import _ReadableHTML, _fetch
++
++    try:
++        final_url, content_type, data, charset = _fetch(api_url)
++    except (ValueError, OSError, http.client.HTTPException) as exc:
++        return None, f"Help Center API request failed: {exc}"
++    if (urllib.parse.urlsplit(final_url).hostname or "").lower() != host:
++        return None, "Help Center API crossed the allowed host"
++    if content_type != "application/json":
++        return None, "Help Center API returned an unsupported content type"
++    try:
++        article = json.loads(data.decode(charset or "utf-8", errors="replace"))["article"]
++    except (ValueError, KeyError, TypeError, LookupError):
++        return None, "Help Center API returned malformed JSON"
++    if not isinstance(article, dict) or str(article.get("id")) != article_id:
++        return None, "Help Center API returned a different article"
++    if article.get("draft"):
++        return None, "Help Center API returned a draft article"
++    html_url = str(article.get("html_url") or "")
++    if (urllib.parse.urlsplit(html_url).hostname or "").lower() != host:
++        return None, "Help Center API returned an unexpected article URL"
++
++    parser = _ReadableHTML()
++    parser.feed(str(article.get("body") or ""))
++    body = parser.markdown()
++    title = str(article.get("title") or "").strip()
++    if len(body.strip()) < min_chars or _challenge_page(title, body):
++        return None, "Help Center API returned empty or challenge-protected content"
++    header = f"# {title}\n\n" if title else ""
++    updated = str(article.get("updated_at") or "").strip()
++    if updated:
++        header += f"Last updated: {updated}\n\n"
++    return {
++        "url": html_url,
++        "title": title,
++        "content": (header + body)[:max_chars],
++    }, None
++
++
+ def _reader_extract(
+     url: str, *, min_chars: int, max_chars: int
+ ) -> tuple[Optional[Dict[str, str]], Optional[str]]:
+@@ -434,6 +535,22 @@ def maybe_extract_with_browser(
+         if not url or not _safe_public_url(url):
+             continue
+         attempted += 1
++        # A documented public article API is cheaper and more faithful than a
++        # browser read, so try it before launching Chromium.
++        api_value, api_error = _zendesk_article_extract(
++            url, min_chars=min_chars, max_chars=max_chars
++        )
++        if isinstance(api_value, dict):
++            content = str(api_value.get("content") or "")
++            output[index] = {
++                "url": str(api_value.get("url") or url),
++                "title": str(api_value.get("title") or ""),
++                "content": content,
++                "raw_content": content,
++                "metadata": {"retrieval": "help-center-api"},
++                "retrieval": "help-center-api",
++            }
++            continue
+         if browser_ready:
+             browser_value, browser_error = _browser_dom(
+                 url,
+@@ -469,9 +586,10 @@ def maybe_extract_with_browser(
+                 }
+             else:
+                 logger.info(
+-                    "Browser and reader extract fallbacks did not recover %s: "
+-                    "browser=%s reader=%s",
++                    "Extract fallbacks did not recover %s: "
++                    "help_center=%s browser=%s reader=%s",
+                     url,
++                    api_error,
+                     browser_error,
+                     reader_error,
+                 )

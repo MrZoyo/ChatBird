@@ -544,3 +544,159 @@ def test_web_extract_dispatches_internal_browser_fallback(monkeypatch):
     )
     assert result[0]["title"] == "Recovered"
     assert result[0]["content"] == "browser-rendered content"
+
+
+def test_zendesk_article_api_url_is_exact_host_and_article_path_only():
+    import tools.web_browser_fallback as fallback
+
+    config = _enabled_config(zendesk_article_api_hosts=["support.discord.com"])
+    mapped = fallback._zendesk_article_api_url(
+        "https://support.discord.com/hc/en-us/articles/115000084051-Age-Restricted"
+        "?utm_source=x#top",
+        config,
+    )
+    assert mapped == (
+        "https://support.discord.com/api/v2/help_center/en-us/articles/115000084051.json",
+        "115000084051",
+    )
+    assert fallback._zendesk_article_api_url(
+        "https://support.discord.com/hc/articles/42", config
+    ) == ("https://support.discord.com/api/v2/help_center/articles/42.json", "42")
+
+    for url in (
+        "http://support.discord.com/hc/en-us/articles/42",
+        "https://support.discord.com.evil.test/hc/en-us/articles/42",
+        "https://evil.test/hc/en-us/articles/42",
+        "https://user:pass@support.discord.com/hc/en-us/articles/42",
+        "https://support.discord.com:8443/hc/en-us/articles/42",
+        "https://support.discord.com/hc/en-us/sections/42",
+        "https://support.discord.com/hc/en-us/articles/42/comments",
+        "https://support.discord.com/api/v2/help_center/en-us/articles/42.json",
+    ):
+        assert fallback._zendesk_article_api_url(url, config) is None, url
+    assert fallback._zendesk_article_api_url(
+        "https://support.discord.com/hc/en-us/articles/42", _enabled_config()
+    ) is None
+
+
+def test_zendesk_article_extract_validates_api_response(monkeypatch):
+    import tools.web_browser_fallback as fallback
+    from plugins.web.simple_http import provider
+
+    config = _enabled_config(zendesk_article_api_hosts=["support.discord.com"])
+    monkeypatch.setattr(fallback, "_fallback_config", lambda: config)
+    monkeypatch.setattr(fallback, "_safe_public_url", lambda url: True)
+    page = "https://support.discord.com/hc/en-us/articles/42-Policy"
+    api = "https://support.discord.com/api/v2/help_center/en-us/articles/42.json"
+
+    def article(**overrides):
+        value = {
+            "id": 42,
+            "title": "Policy",
+            "html_url": page,
+            "draft": False,
+            "updated_at": "2026-10-11T19:42:21Z",
+            "body": "<h2>Rules</h2><p>Mark channels as <b>age-restricted</b>.</p>"
+            "<script>alert(1)</script>",
+        }
+        value.update(overrides)
+        return value
+
+    def serve(payload, final_url=api, content_type="application/json"):
+        body = json.dumps({"article": payload}).encode()
+        monkeypatch.setattr(
+            provider,
+            "_fetch",
+            lambda url: (final_url, content_type, body, "utf-8"),
+        )
+
+    serve(article())
+    value, error = fallback._zendesk_article_extract(page, min_chars=10, max_chars=5000)
+    assert error is None
+    assert value["url"] == page
+    assert value["title"] == "Policy"
+    assert value["content"].startswith("# Policy\n\nLast updated: 2026-10-11T19:42:21Z")
+    assert "age-restricted" in value["content"]
+    assert "<b>" not in value["content"] and "alert(1)" not in value["content"]
+
+    rejected = (
+        (article(id=43), {}, "different article"),
+        (article(draft=True), {}, "draft"),
+        (article(html_url="https://evil.test/hc/en-us/articles/42"), {}, "unexpected article URL"),
+        (article(body="<p></p>"), {}, "empty or challenge"),
+        (article(), {"final_url": "https://evil.test/a.json"}, "crossed the allowed host"),
+        (article(), {"content_type": "text/html"}, "unsupported content type"),
+    )
+    for payload, kwargs, expected in rejected:
+        serve(payload, **kwargs)
+        value, error = fallback._zendesk_article_extract(page, min_chars=10, max_chars=5000)
+        assert value is None and expected in error, (expected, error)
+
+    def fail(url):
+        raise ValueError("HTTP 403")
+
+    monkeypatch.setattr(provider, "_fetch", fail)
+    value, error = fallback._zendesk_article_extract(page, min_chars=10, max_chars=5000)
+    assert value is None and "HTTP 403" in error
+
+    value, error = fallback._zendesk_article_extract(
+        "https://other.test/hc/en-us/articles/42", min_chars=10, max_chars=5000
+    )
+    assert value is None and "not an allowlisted" in error
+
+
+def test_extract_prefers_help_center_api_before_browser(monkeypatch):
+    import tools.web_browser_fallback as fallback
+
+    page = "https://support.discord.com/hc/en-us/articles/42-Policy"
+    monkeypatch.setattr(
+        fallback, "_fallback_config", lambda: _enabled_config(min_content_chars=10)
+    )
+    monkeypatch.setattr(fallback, "browser_backend_ready", lambda: True)
+    monkeypatch.setattr(fallback, "_safe_public_url", lambda url: True)
+    monkeypatch.setattr(
+        fallback,
+        "_zendesk_article_extract",
+        lambda *args, **kwargs: (
+            {"url": page, "title": "Policy", "content": "article from api"},
+            None,
+        ),
+    )
+
+    def no_browser(*args, **kwargs):
+        raise AssertionError("browser must not start after an API recovery")
+
+    monkeypatch.setattr(fallback, "_browser_dom", no_browser)
+    result = fallback.maybe_extract_with_browser(
+        [{"url": page, "content": "", "error": "HTTP 403"}], [page]
+    )
+    assert result[0]["retrieval"] == "help-center-api"
+    assert result[0]["content"] == "article from api"
+
+
+def test_extract_uses_browser_when_help_center_api_fails(monkeypatch):
+    import tools.web_browser_fallback as fallback
+
+    page = "https://support.discord.com/hc/en-us/articles/42-Policy"
+    monkeypatch.setattr(
+        fallback, "_fallback_config", lambda: _enabled_config(min_content_chars=10)
+    )
+    monkeypatch.setattr(fallback, "browser_backend_ready", lambda: True)
+    monkeypatch.setattr(fallback, "_safe_public_url", lambda url: True)
+    monkeypatch.setattr(
+        fallback,
+        "_zendesk_article_extract",
+        lambda *args, **kwargs: (None, "Help Center API request failed: HTTP 403"),
+    )
+    monkeypatch.setattr(
+        fallback,
+        "_browser_dom",
+        lambda *args, **kwargs: (
+            {"url": page, "title": "Policy", "content": "article from browser"},
+            None,
+        ),
+    )
+    result = fallback.maybe_extract_with_browser(
+        [{"url": page, "content": "", "error": "HTTP 403"}], [page]
+    )
+    assert result[0]["retrieval"] == "browser-fallback"

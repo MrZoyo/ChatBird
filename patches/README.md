@@ -70,6 +70,18 @@ paths. A query that names HSGuru but receives no HSGuru link may issue at most
 two bounded queries against DDGS's Yahoo public index; non-HSGuru URLs are
 removed and explicit rate limits are not retried.
 
+The Help Center article patch adds one more `web_extract` fallback. When the
+primary extractor fails on an exact host listed in
+`web.browser_fallback.zendesk_article_api_hosts`, an article URL
+(`/hc/<locale>/articles/<id>`) is read from the public Zendesk Help Center
+API (`/api/v2/help_center/<locale>/articles/<id>.json`). This runs before
+Chromium starts. The request uses the simple-http fetcher and its public-network,
+redirect and size guards. It must stay on the same host and return the
+requested, published article; query strings are never forwarded. Discord's
+Help Center (`support.discord.com`) answers article pages with a Cloudflare
+challenge for every non-browser client. Its robots rules allow article pages
+and the article API, and disallow only the view-statistics endpoint.
+
 The Anthropic user-key patch classifies `sk-ant-usr-*` API keys like Console
 `sk-ant-api*` keys: they authenticate with `x-api-key` and never receive the
 Claude Code OAuth identity transforms (system-prompt prefix, product-name
