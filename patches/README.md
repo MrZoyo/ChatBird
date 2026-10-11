@@ -70,6 +70,12 @@ paths. A query that names HSGuru but receives no HSGuru link may issue at most
 two bounded queries against DDGS's Yahoo public index; non-HSGuru URLs are
 removed and explicit rate limits are not retried.
 
+The Anthropic user-key patch classifies `sk-ant-usr-*` API keys like Console
+`sk-ant-api*` keys: they authenticate with `x-api-key` and never receive the
+Claude Code OAuth identity transforms (system-prompt prefix, product-name
+rewrites, `mcp__` tool renames, CLI user agent). Upstream Hermes still treats
+every other `sk-ant-*` prefix as an OAuth token as of 2026-10-09.
+
 `hermes-gateway-browser.conf` is the tracked systemd drop-in for the stable
 local Chromium launcher. Install it under
 `/etc/systemd/system/hermes-gateway.service.d/`, then reload systemd. Keep the

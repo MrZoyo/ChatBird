@@ -1,0 +1,67 @@
+diff --git a/agent/anthropic_adapter.py b/agent/anthropic_adapter.py
+index 4f7595c9..b4edc9bb 100644
+--- a/agent/anthropic_adapter.py
++++ b/agent/anthropic_adapter.py
+@@ -5,7 +5,7 @@ Anthropic's Messages API. Follows the same pattern as the codex_responses
+ adapter — all provider-specific logic is isolated here.
+ 
+ Auth supports:
+-  - Regular API keys (sk-ant-api*) → x-api-key header
++  - Regular API keys (sk-ant-api*, sk-ant-usr*) → x-api-key header
+   - OAuth setup-tokens (sk-ant-oat*) → Bearer auth + beta header
+   - Claude Code credentials (~/.claude.json or ~/.claude/.credentials.json) → Bearer auth
+ """
+@@ -387,7 +387,8 @@ def _is_oauth_token(key: str) -> bool:
+     """Check if the key is an Anthropic OAuth/setup token.
+ 
+     Positively identifies Anthropic OAuth tokens by their key format:
+-    - ``sk-ant-`` prefix (but NOT ``sk-ant-api``) → setup tokens, managed keys
++    - ``sk-ant-`` prefix (but NOT ``sk-ant-api`` or ``sk-ant-usr``) → setup
++      tokens, managed keys
+     - ``eyJ`` prefix → JWTs from the Anthropic OAuth flow
+     - ``cc-`` prefix → Claude Code OAuth access tokens (from CLAUDE_CODE_OAUTH_TOKEN)
+ 
+@@ -396,8 +397,9 @@ def _is_oauth_token(key: str) -> bool:
+     """
+     if not key:
+         return False
+-    # Regular Anthropic Console API keys — x-api-key auth, never OAuth
+-    if key.startswith("sk-ant-api"):
++    # Regular Anthropic API keys — x-api-key auth, never OAuth. Console keys
++    # use sk-ant-api*; user-scoped API keys use sk-ant-usr*.
++    if key.startswith(("sk-ant-api", "sk-ant-usr")):
+         return False
+     # Anthropic-issued tokens (setup-tokens sk-ant-oat-*, managed keys)
+     if key.startswith("sk-ant-"):
+diff --git a/tests/agent/test_anthropic_adapter.py b/tests/agent/test_anthropic_adapter.py
+index 109793d2..2a040c24 100644
+--- a/tests/agent/test_anthropic_adapter.py
++++ b/tests/agent/test_anthropic_adapter.py
+@@ -41,6 +41,9 @@ class TestIsOAuthToken:
+     def test_api_key(self):
+         assert _is_oauth_token("sk-ant-api03-abcdef1234567890") is False
+ 
++    def test_user_api_key(self):
++        assert _is_oauth_token("sk-ant-usr-abcdef1234567890") is False
++
+     def test_managed_key(self):
+         # Managed keys from ~/.claude.json without a recognisable Anthropic
+         # prefix are not positively identified as OAuth.  They enter the system
+@@ -104,6 +107,17 @@ class TestBuildAnthropicClient:
+             assert "oauth-2025-04-20" not in betas  # OAuth-only beta NOT present
+             assert "claude-code-20250219" not in betas  # OAuth-only beta NOT present
+ 
++    def test_user_api_key_uses_api_key(self):
++        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
++            build_anthropic_client("sk-ant-usr-something")
++            kwargs = mock_sdk.Anthropic.call_args[1]
++            assert kwargs["api_key"] == "sk-ant-usr-something"
++            assert "auth_token" not in kwargs
++            betas = kwargs["default_headers"]["anthropic-beta"]
++            assert "oauth-2025-04-20" not in betas
++            assert "claude-code-20250219" not in betas
++            assert "user-agent" not in kwargs["default_headers"]
++
+     def test_custom_base_url(self):
+         with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+             build_anthropic_client("sk-ant-api03-x", base_url="https://custom.api.com")

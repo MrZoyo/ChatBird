@@ -4,7 +4,7 @@ set -euo pipefail
 host="${1:-aliyun-germany}"
 
 required=(
-  XIAOMI_API_KEY
+  ANTHROPIC_API_KEY
   DISCORD_BOT_TOKEN
 )
 
@@ -51,7 +51,10 @@ trap 'rm -f "$tmp"' EXIT
 chmod 600 "$tmp"
 
 {
-  printf 'XIAOMI_API_KEY=%s\n' "$XIAOMI_API_KEY"
+  printf 'ANTHROPIC_API_KEY=%s\n' "$ANTHROPIC_API_KEY"
+  if [[ -n "${XIAOMI_API_KEY:-}" ]]; then
+    printf 'XIAOMI_API_KEY=%s\n' "$XIAOMI_API_KEY"
+  fi
   printf 'DISCORD_BOT_TOKEN=%s\n' "$DISCORD_BOT_TOKEN"
   printf 'DISCORD_ALLOWED_USERS=%s\n' "${DISCORD_ALLOWED_USERS:-}"
   printf 'DISCORD_ALLOWED_ROLES=%s\n' "${DISCORD_ALLOWED_ROLES:-}"

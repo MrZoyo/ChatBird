@@ -1,0 +1,27 @@
+# ChatBird production SSH protection.
+# sshd listens on 22 (IP-restricted by the cloud firewall) and on 22222 (public).
+[DEFAULT]
+ignoreip = 127.0.0.1/8 ::1
+bantime = 1h
+findtime = 10m
+maxretry = 5
+# Repeat offenders get doubled bans, capped at one week.
+bantime.increment = true
+bantime.factor = 2
+bantime.maxtime = 1w
+
+[sshd]
+enabled = true
+port = 22,22222
+# Also count pre-auth disconnects and key-exchange probes from scanners.
+mode = aggressive
+
+# Ban IPs on every port for a week after three bans within a day.
+[recidive]
+enabled = true
+backend = auto
+logpath = /var/log/fail2ban.log
+banaction = %(banaction_allports)s
+bantime = 1w
+findtime = 1d
+maxretry = 3

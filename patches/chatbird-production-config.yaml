@@ -1,13 +1,13 @@
 model:
-  provider: xiaomi
-  default: mimo-v2.6-flash
+  provider: anthropic
+  default: claude-sonnet-5-5
 
-# This Hermes version otherwise pins Xiaomi vision calls to mimo-v2.5.
-# Text auxiliary tasks inherit model.default.
+# Text auxiliary tasks inherit model.default; vision is pinned explicitly so
+# it never falls back to another provider's default vision model.
 auxiliary:
   vision:
-    provider: xiaomi
-    model: mimo-v2.6-flash
+    provider: anthropic
+    model: claude-sonnet-5-5
 
 # One shared transcript per Discord channel; the patched session suffix keeps
 # every Guild in a separate session and memory namespace.

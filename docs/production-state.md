@@ -1,6 +1,6 @@
 # ChatBird 生产状态与修改总览
 
-模型与服务状态最后核对：2026-09-27（Europe/Berlin）。其他功能的历史验证日期见各节。
+模型与服务状态最后核对：2026-10-11（Europe/Berlin）。其他功能的历史验证日期见各节。
 
 这份文档是 ChatBird 当前生产部署的非敏感总览，用于在仓库长期休眠后快速恢复上下文。它记录架构、ID 映射、安全边界、Hermes 补丁和验证方式，但不保存 API Key、Bot Token 或其他凭据。
 
@@ -8,18 +8,83 @@
 
 | 项目 | 当前值 |
 |---|---|
-| SSH 主机别名 | `aliyun-germany` |
+| SSH 主机别名 | `aliyun-germany`（端口 `22222`；`22` 由云防火墙限制来源 IP） |
 | Hermes 源码 | `/usr/local/lib/hermes-agent` |
 | Hermes 配置 | `/root/.hermes/config.yaml` |
 | Hermes 环境变量 | `/root/.hermes/.env`，权限应为 `0600` |
 | ChatBird 身份提示词 | `/root/.hermes/SOUL.md` |
 | systemd 服务 | `hermes-gateway.service` |
-| 模型 | Xiaomi MiMo `mimo-v2.6-flash`（主模型、文本辅助任务和图片分析） |
+| 模型 | Anthropic Claude Sonnet 5.5 `claude-sonnet-5-5`（主模型、文本辅助任务和图片分析） |
 | 策略插件 | `chatbird-policy` `1.3.2` |
 
 生产机只有约 1.6 GiB 内存。只能做定向读取、单文件测试和短日志检查；不要在生产机运行全仓扫描、完整测试套件、高并发构建或无必要升级。不要打印、复制到日志或提交 `/root/.hermes/.env` 的实际值。
 
 本地非敏感配置镜像是 [`../patches/chatbird-production-config.yaml`](../patches/chatbird-production-config.yaml)，环境变量格式参考 [`../.env.example`](../.env.example)。
+
+### 2026-10-11 Claude Sonnet 5.5 切换
+
+用户每月有 200 美元仅限 API 使用的 Claude 额度，确认主对话和辅助任务改用
+Claude Sonnet 5.5（`claude-sonnet-5-5`），通过 Anthropic 原生 Messages API
+`https://api.anthropic.com` 调用。生产仅修改以下两项，文本辅助任务继续继承主模型：
+
+```yaml
+model:
+  provider: anthropic
+  default: claude-sonnet-5-5
+
+auxiliary:
+  vision:
+    provider: anthropic
+    model: claude-sonnet-5-5
+```
+
+新凭据以 `ANTHROPIC_API_KEY` 追加到 `.env`，权限保持 `0600`；`XIAOMI_API_KEY`
+保留用于回退。该 Key 的前缀是 `sk-ant-usr-`。当前 Hermes（上游 2026-10-09 的
+`main` 仍然如此）把 `sk-ant-api*` 以外的所有 `sk-ant-*` 视为 OAuth token，会改用
+Bearer 认证并套用 Claude Code 身份转换：系统提示前置 Claude Code 身份、把
+“Hermes Agent” 替换为 “Claude Code”、给工具名加 `mcp__` 前缀并伪装 CLI
+User-Agent，从而改写 ChatBird 人设。新增补丁
+[`hermes-anthropic-user-api-key.patch`](../patches/hermes-anthropic-user-api-key.patch)
+让 `sk-ant-usr-*` 与普通 API Key 一样走 `x-api-key`。
+
+Hermes 的 Anthropic SDK 是可选依赖，生产 venv 原先没有安装。本次只安装 Hermes
+锁定的 `anthropic==0.87.0` 及其新增依赖 `docstring_parser`，未升级 Hermes 或其他依赖。
+
+`agent.reasoning_effort` 仍未设置。此时 Hermes 不发送 `thinking` 和 `effort`，
+Sonnet 5.5 按 API 默认值运行：自适应思考、effort `high`。Sonnet 5.5 会拒绝
+`thinking: disabled`、强制 `tool_choice` 和非默认采样参数；已核对当前 Hermes
+不会在这些路径上发送它们：关闭思考时省略参数，Claude 4.7 及以后的模型自动去掉采样参数，
+非测试代码不使用强制 `tool_choice`。旧轮次的 thinking 块会被剥离，只保留最新助手回合的签名块。
+
+验证结果：
+
+- 本地：9 个补丁可干净应用到锁定基线；Hermes Anthropic 相关测试 438 项通过。
+  另有 3 项 `TestRunOauthSetupToken` 在 macOS 上失败，未打补丁的基线同样失败
+  （钥匙串读取路径），与生产 Linux 无关。本地配置守卫和 21 项 ChatBird 单元测试通过。
+- 生产切换前：`anthropic_adapter.py` 与锁定基线逐字节一致，补丁 `git apply --check`
+  通过，生产定向测试 18 项通过。经打补丁的适配器串行烟测，认证方式均为
+  `x-api-key`，模型均为 `claude-sonnet-5-5`：流式文本 1.31 秒；合成工具调用及结果
+  回传两次请求合计约 2.0 秒，未执行外部工具；合成纯红 PNG 识别为 `RED`，1.02 秒。
+- 配置按 YAML 结构比较，只有 `model` 与 `auxiliary.vision` 变化；生产配置守卫通过。
+- 网关于 22:28:24 CEST 重启，新 PID 为 `633777`，22:28:30 确认 Discord 以
+  `小鸟AI#6255` 连接，服务为 `active/running`、`NRestarts=0`。重启后的错误日志只有
+  Hermes 安全审计的两条既有警告：以 root 运行、SSH 允许密码登录。旧进程收到
+  SIGTERM 后以状态 1 退出，与前两次切换相同。
+- 切换后按生产配置解析：主 runtime 为 `anthropic` / `anthropic_messages` /
+  `https://api.anthropic.com`；压缩、标题生成、网页摘要、后台审阅和视觉客户端均为
+  `claude-sonnet-5-5` 且不走 OAuth。标题生成客户端实际调用返回 `PROD_OK`，耗时 1.34 秒。
+
+这些是简短 API 烟测，不是 Discord 用户侧的对话验收。
+
+切换前备份（仅生产机，目录权限 `0700`）：
+`/root/.hermes/backups/claude-sonnet-5-5-20261011T202608Z/`，包含 `config.yaml`、
+`.env`、`anthropic_adapter.py` 及其测试文件。回退时先核对此后的配置变更，再定向
+恢复两处模型设置并重启网关；`XIAOMI_API_KEY` 仍在 `.env` 中，补丁和 SDK 可以保留。
+
+配置 SHA-256：
+
+- 切换前：`9df20a239be68f4d64047e453762256441e39e04f5b1ee29aa56cb189904cc92`
+- 切换后：`2d3b8180ebd3e48a4c58773ac3db0eabd8343768e1e3591fa36087cc4c393ae4`
 
 ### 2026-09-27 MiMo V2.6 Flash 切换
 
@@ -274,6 +339,7 @@ Git 工作树；该脚本用于重建和升级验证，不直接覆盖生产工�
 | [`../patches/hermes-skill-policy-exception.patch`](../patches/hermes-skill-policy-exception.patch) | 公共频道跳过不可用的 Skill 加载并直接使用网页工具 |
 | [`../patches/hermes-public-skills-web-extract.patch`](../patches/hermes-public-skills-web-extract.patch) | 公开 Skill 哈希审批、自我改进二次审批与无密钥静态网页提取 |
 | [`../patches/hermes-web-browser-fallback.patch`](../patches/hermes-web-browser-fallback.patch) | `web_search`/`web_extract` 内部受限浏览器回退，不扩大公开工具权限 |
+| [`../patches/hermes-anthropic-user-api-key.patch`](../patches/hermes-anthropic-user-api-key.patch) | `sk-ant-usr-*` Anthropic API Key 走 `x-api-key`，不套用 Claude Code OAuth 身份转换 |
 | [`../patches/hermes-gateway-browser.conf`](../patches/hermes-gateway-browser.conf) | Hermes 服务的本地 Chromium 可执行文件位置 |
 | [`../plugins/chatbird-policy/`](../plugins/chatbird-policy/) | 请求级工具权限、管理员上下文与分层记忆 |
 | [`../patches/hermes-tests/test_discord_chatbird_access.py`](../patches/hermes-tests/test_discord_chatbird_access.py) | 生产 Hermes Discord 定向回归测试 |
@@ -293,6 +359,8 @@ Git 工作树；该脚本用于重建和升级验证，不直接覆盖生产工�
 
 - `hermes-discord-category-channel-allowlist.patch`
 - `hermes-skill-policy-exception.patch`
+
+2026-10-11 起，生产工作树另外应用 `hermes-anthropic-user-api-key.patch`。
 
 这些差异、生产配置、策略插件和测试均以 ChatBird 仓库 `main` 为唯一长期来源；
 `codex/track-hermes-stack` 只是已合并的历史开发分支，不再承载独有内容。
@@ -338,6 +406,7 @@ Category `1149352792532734052` 用于动态创建的临时语音频道。语音�
 ```bash
 ssh aliyun-germany
 systemctl is-active hermes-gateway.service
+fail2ban-client status sshd
 systemctl show hermes-gateway.service -p MainPID -p NRestarts -p MemoryCurrent
 journalctl -u hermes-gateway.service --since "10 minutes ago" --no-pager -n 100
 git -C /usr/local/lib/hermes-agent status --short
@@ -359,3 +428,25 @@ git -C /usr/local/lib/hermes-agent log -5 --oneline
 `AGENT_BROWSER_EXECUTABLE_PATH` 将 Hermes 指向该入口。升级 `agent-browser` 或
 Chromium 后，应更新稳定入口并重新执行浏览器 requirements、公开网页导航、DOM
 读取和进程清理四项定向烟测。不要在这台小服务器上配置常驻浏览器池或并发浏览器。
+
+### SSH 与 fail2ban
+
+2026-10-11 核对：
+
+- sshd 同时监听 `22` 和 `22222`。`22` 由云防火墙限制来源 IP，日常从 Mac 使用
+  `22222`；`~/.ssh/config` 中的 `aliyun-germany` 已设为 `Port 22222`。主机 ED25519
+  指纹为 `SHA256:KtKiq81KDydvJ5ZW3TPvLXXM1h3B+mwyBLeb0XlNZqQ`。
+- 本机 ufw 未启用，iptables 没有规则，端口限制只在云安全组一层。
+- fail2ban `1.0.2`（Ubuntu 包）使用 systemd journal 和 nftables。本地规则位于
+  `/etc/fail2ban/jail.d/chatbird.local`，仓库副本为
+  [`../deploy/fail2ban/chatbird.local`](../deploy/fail2ban/chatbird.local)：
+  - `sshd` 同时封禁 `22,22222`：10 分钟内失败 5 次封 1 小时，`mode = aggressive`；
+    重复违规的封禁时间按 2 倍递增，最长 1 周。
+  - `recidive`：1 天内被封 3 次的地址全端口封禁 1 周。
+- 演练封禁测试地址 `192.0.2.123` 后，nftables 规则覆盖 `tcp dport { 22, 22222 }`；
+  解封后规则清空。fail2ban 常驻内存约 38 MiB。
+- 9 月 13 日以来的 auth 日志没有失败登录记录。
+- sshd 仍允许 root 使用密码登录（`PasswordAuthentication yes`），Hermes 安全审计也对此告警。
+  是否改为仅密钥登录待用户决定。
+
+误封自己时，通过阿里云控制台登录后执行 `fail2ban-client set sshd unbanip <IP>`。
