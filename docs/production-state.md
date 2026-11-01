@@ -15,11 +15,78 @@
 | ChatBird 身份提示词 | `/root/.hermes/SOUL.md` |
 | systemd 服务 | `hermes-gateway.service` |
 | 模型 | Anthropic Claude Sonnet 5.5 `claude-sonnet-5-5`（主模型、文本辅助任务和图片分析） |
-| 策略插件 | `chatbird-policy` `1.3.2` |
+| 备用模型 | Xiaomi `mimo-v2.6-flash`（主模型调用失败时切换；图片分析不跟随） |
+| 策略插件 | `chatbird-policy` `1.4.0` |
 
 生产机只有约 1.6 GiB 内存。只能做定向读取、单文件测试和短日志检查；不要在生产机运行全仓扫描、完整测试套件、高并发构建或无必要升级。不要打印、复制到日志或提交 `/root/.hermes/.env` 的实际值。
 
 本地非敏感配置镜像是 [`../patches/chatbird-production-config.yaml`](../patches/chatbird-production-config.yaml)，环境变量格式参考 [`../.env.example`](../.env.example)。
+
+### 2026-11-01 安全修复、频道历史与 MiMo 备用
+
+用户让一个 Fable subagent 作为安全顾问，先确认问题和修复方案，再实施。本次部署：
+
+- **图片下载 SSRF：** `vision_analyze` 的重定向防护检查 `response.next_request`，而 httpx 0.28.1
+  在响应钩子里不设置它，防护从不生效，公开用户可以让一个公网图片 URL 302 到内部地址。非图片
+  内容会被拒绝，但目标若返回图片，内容会被模型描述。回补上游 `500c2b1e46`，新增补丁
+  `hermes-vision-redirect-ssrf.patch` 和回归测试。
+- **策略闸门不再放行丢失身份的调用：** 旧逻辑对非 Discord 上下文一律放行，而网关里丢失身份的
+  工作线程（已确认的路径是 `delegate_task` 的批量子任务）正好属于这一类。现在由网关进程标记
+  `_HERMES_GATEWAY` 判断：网关内只有 cron（空 platform 且 session ID 以 `cron_` 开头）可以不带
+  Discord 身份，其余一律拒绝；本地 CLI 不受影响。Fable 原方案用 ContextVar 的 `_UNSET` 识别 CLI，
+  但丢失身份的线程同样是 `_UNSET`，因此没有采用。代价是管理员回合的批量 `delegate_task` 子任务
+  现在没有工具可用。
+- **`session_search` 在 Discord 和 cron 中禁用：** 它不按 Guild 过滤，管理员回合可以读到其他 Guild
+  的会话，违反隔离约定。
+- **新增 `chatbird_channel_history`：** 见“会话与历史边界”。
+- **备用模型：** 配置 `fallback_model`（Xiaomi `mimo-v2.6-flash`），`XIAOMI_API_KEY` 已在 `.env` 中。
+  每个新回合先试主模型，额度恢复后自动切回。图片分析固定走 Anthropic，额度耗尽时会失败。
+
+```yaml
+fallback_model:
+  provider: xiaomi
+  model: mimo-v2.6-flash
+```
+
+用户决定不设按人或按频道的配额，额度用完可以接受。10 月 11 日切换到 Claude 后至 11 月 1 日：
+6 个会话、42 条用户消息、9 次工具调用，均在公开白名单内。按 token 数估算主对话花费约 2.6–4 美元
+（Hermes 的费用字段为 0，且不含辅助任务；准确数字以 Anthropic Console 为准）。
+
+验证结果：
+
+- 本地：ChatBird 单元测试 36 项通过；11 个补丁可干净应用到锁定基线；重建后的栈上 URL 安全、
+  重定向回归、静态提取、浏览器回退、Discord 访问、频道控制和公开 Skill 相关定向测试通过。去掉修复后
+  新回归测试会失败。
+- 闸门用真实的 `gateway.session_context` 和真实线程探测：网关内丢失身份、公开回合和管理员回合的裸线程
+  都被拒绝；管理员主线程、cron 和本地 CLI 保持可用。
+- 模型切换：用真实 `AIAgent` 和 Anthropic SDK 对本地模拟服务器验证，“API 用量上限” 400、“余额不足” 400
+  和模拟的“消费上限” 403 都切到备用。Anthropic 实际额度耗尽时的错误文本未能实测。生产上用故意无效的
+  Anthropic Key 跑了一次真实切换，返回 `FALLBACK_OK`，当前 provider 为 `xiaomi`。
+- 生产：补丁 `git apply --check` 通过；定向测试 129 项通过；Discord 平台工具解析包含
+  `chatbird_channel_history`。频道历史实测（只输出计数）：测试频道读 20 条返回 19 行；`limit=5000` 被
+  限制为扫描 200 条；用另一 Guild 的身份读该频道被拒绝。curator 上次运行为
+  `llm: skipped (consolidation off)`，不启动 Agent，不受闸门影响。
+- 网关于 23:31:47 CET 重启，新 PID 为 `762846`，Discord 已连接，`NRestarts=0`。旧进程收到 SIGTERM 后以
+  状态 1 退出，与前几次切换相同。重启后日志只有 Hermes 安全审计的两条既有警告。
+
+这些不是 Discord 用户侧的对话验收。
+
+尚未处理：
+
+- sshd 仍允许 root 密码登录，由用户执行。服务仍以 root 运行，没有 systemd 沙箱。
+- 图片下载的 DNS 重绑定防护（上游 `42626da1ce`）改动面较大，留待升级 Hermes。
+- Hermes 升级：锁定基线为 v0.17.0（2026-06-27），最新稳定版 v0.22.5（2026-10-23）。把补丁栈与 2026-11-01
+  的上游 main 试合并，17 个文件冲突，包括 `gateway/session.py`、`gateway/run.py`、Discord 适配器和
+  `tools/memory_tool.py`。升级应单独安排，并以稳定 tag 为目标。main 已有原生 `scope_id` 会话隔离，可能替代
+  部分 Guild 隔离补丁；但 `session_search` 仍无 Guild 过滤，适配器也未识别 `sk-ant-usr`。
+
+部署前备份（仅生产机，目录权限 `0700`）：
+`/root/.hermes/backups/security-history-fallback-20261101T222947Z/`。
+
+配置 SHA-256：
+
+- 部署前：`884e68901e7e54e0b0b752caf271c063f897a68f6518154ba47c595264895bac`
+- 部署后：`ef1a875d3ebebbc68fb9d295d0e4e4f840a22ac0a98407017a7ec5f20397a229`
 
 ### 2026-11-01 Anthropic Key 轮换
 
@@ -29,7 +96,8 @@
 
 具体限制在创建 Key 时设置，这里无法读取。API 响应头只显示速率上限（请求 13,000、
 输入 token 10,000,000、输出 token 2,000,000），看不到消费限额。生产没有配置
-`fallback_model`，Key 达到限额后 Bot 会报错，不会自动切到 `XIAOMI_API_KEY`。
+`fallback_model`，Key 达到限额后 Bot 会报错，不会自动切到 `XIAOMI_API_KEY`（这是当时的状态，
+同日稍后已配置备用模型，见上一节）。
 
 验证结果：
 
@@ -267,11 +335,14 @@ auxiliary:
   用户通过 Discord“回复”指向更早消息时，另外读取该消息及其之前最多 10 条。
 - 会话按 Hermes 默认策略重置：每天 04:00（服务器时区 Asia/Shanghai）或闲置 24 小时，
   以先到者为准。重置后，Bot 上一条回复之前的内容既不在会话中，也不会被回填。
+- 需要更早的内容时，模型可以自己调用 `chatbird_channel_history`，通过 Discord REST 读取当前频道最近最多
+  200 条消息，可按关键词筛选。频道只取自请求身份，不接受模型传参，并核对频道所属 Guild。结果标记为不可信
+  数据，总长度上限约 4 万字符；系统消息、空消息和其他 Bot 的消息被过滤。在讨论串中只读该讨论串，不读父频道。
 - 未列入 `discord.allowed_guilds` 的服务器 fail closed，即使公开 Bot 被邀请进去也不能使用 Agent。
 
 ## 用户与管理员权限
 
-普通用户可以在允许的 Guild 和频道中聊天、提问、搜索网页、提取静态网页正文和进行视觉分析。生产使用无需密钥的 DDGS 搜索后端，以及无需密钥、按请求工作的 `simple-http` 静态 HTML/text/JSON/XML 提取后端。普通用户还能列出和读取经过独立审批、与当前文件 SHA-256 绑定的公开 Skill；未审批、被修改或无法验证的 Skill 不可见。公开读取不会执行 Skill 模板、内联命令或密钥初始化。普通用户不能使用终端、文件、代码执行、内置记忆、会话搜索、Cron、Skill 管理、代理委派、跨平台消息、计算机控制或 Kanban 等敏感工具。
+普通用户可以在允许的 Guild 和频道中聊天、提问、搜索网页、提取静态网页正文和进行视觉分析。生产使用无需密钥的 DDGS 搜索后端，以及无需密钥、按请求工作的 `simple-http` 静态 HTML/text/JSON/XML 提取后端。普通用户还能列出和读取经过独立审批、与当前文件 SHA-256 绑定的公开 Skill；未审批、被修改或无法验证的 Skill 不可见。公开读取不会执行 Skill 模板、内联命令或密钥初始化。普通用户还可以通过 `chatbird_channel_history` 让 Bot 读取当前频道最近最多 200 条消息。普通用户不能使用终端、文件、代码执行、内置记忆、会话搜索、Cron、Skill 管理、代理委派、跨平台消息、计算机控制或 Kanban 等敏感工具。`session_search` 在管理员频道和 cron 中同样禁用，因为它不按 Guild 过滤。
 
 生产已启用透明本地 Chromium 回退：公开用户仍只调用 `web_search`/`web_extract`，主提供方遇到 403、5xx、超时、JS challenge 或空正文时，Hermes 在后台启动一个短时浏览器，执行固定 DOM 读取后立即关闭。全进程最多同时运行一个回退，单次最多处理两个页面，不向公开用户暴露点击、输入、登录、下载或任意 JavaScript 能力，也不会切换 IP 绕过 HTTP 429 限流。本地 Chromium 可以处理 JavaScript 渲染，但不能保证通过验证码、住宅 IP 或高级反检测挑战。
 
@@ -298,7 +369,7 @@ Age-Restricted Channels 文章：3.9 秒返回 2,746 字符正文，没有启动
 1. Discord 用户 ID 在 `CHATBIRD_ADMIN_USERS` 中；
 2. 当前 `guild_id:channel_id` 精确匹配 `CHATBIRD_ADMIN_CHANNELS`。
 
-因此管理员在普通频道里也只获得普通用户能力。未知 Guild、错误频道、缺失用户信息和 DM 都不能进入管理员上下文。详细规则见 [`multi-user-policy.md`](multi-user-policy.md)。
+因此管理员在普通频道里也只获得普通用户能力。未知 Guild、错误频道、缺失用户信息和 DM 都不能进入管理员上下文。网关内没有 Discord 身份的工具调用一律拒绝，只有 cron 例外。详细规则见 [`multi-user-policy.md`](multi-user-policy.md)。
 
 ## 记忆设计
 
@@ -392,6 +463,7 @@ Git 工作树；该脚本用于重建和升级验证，不直接覆盖生产工�
 | [`../patches/hermes-web-browser-fallback.patch`](../patches/hermes-web-browser-fallback.patch) | `web_search`/`web_extract` 内部受限浏览器回退，不扩大公开工具权限 |
 | [`../patches/hermes-anthropic-user-api-key.patch`](../patches/hermes-anthropic-user-api-key.patch) | `sk-ant-usr-*` Anthropic API Key 走 `x-api-key`，不套用 Claude Code OAuth 身份转换 |
 | [`../patches/hermes-help-center-article-api.patch`](../patches/hermes-help-center-article-api.patch) | 白名单 Zendesk 帮助中心文章在浏览器回退前改读公开文章 API |
+| [`../patches/hermes-vision-redirect-ssrf.patch`](../patches/hermes-vision-redirect-ssrf.patch) | 回补上游修复，让图片下载的重定向防护真正生效 |
 | [`../patches/hermes-gateway-browser.conf`](../patches/hermes-gateway-browser.conf) | Hermes 服务的本地 Chromium 可执行文件位置 |
 | [`../plugins/chatbird-policy/`](../plugins/chatbird-policy/) | 请求级工具权限、管理员上下文与分层记忆 |
 | [`../patches/hermes-tests/test_discord_chatbird_access.py`](../patches/hermes-tests/test_discord_chatbird_access.py) | 生产 Hermes Discord 定向回归测试 |
@@ -413,7 +485,8 @@ Git 工作树；该脚本用于重建和升级验证，不直接覆盖生产工�
 - `hermes-skill-policy-exception.patch`
 
 2026-10-11 起，生产工作树另外应用 `hermes-anthropic-user-api-key.patch` 和
-`hermes-help-center-article-api.patch`。
+`hermes-help-center-article-api.patch`。2026-11-01 起另外应用
+`hermes-vision-redirect-ssrf.patch`。
 
 这些差异、生产配置、策略插件和测试均以 ChatBird 仓库 `main` 为唯一长期来源；
 `codex/track-hermes-stack` 只是已合并的历史开发分支，不再承载独有内容。

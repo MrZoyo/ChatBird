@@ -1,10 +1,11 @@
 # ChatBird Privacy Policy
 
-Last updated: 2026-08-12
+Last updated: 2026-11-01
 
 ChatBird is a Discord assistant available only in servers approved by its
-operator. It is powered by Hermes Agent and Xiaomi MiMo. The bot is also known
-as 小鸟聊天助手, 乌鸦, or ChatBird.
+operator. It is powered by Hermes Agent, with Anthropic Claude as its main model
+and Xiaomi MiMo as a fallback. The bot is also known as 小鸟聊天助手, 乌鸦, or
+ChatBird.
 
 ## What ChatBird Does
 
@@ -29,7 +30,9 @@ ChatBird may process the following Discord data:
 - Attachments included with a request, such as images, audio, video, and
   supported documents.
 - Recent channel context needed to answer a user request, such as summarizing a
-  recent discussion.
+  recent discussion. When ChatBird is invoked, it may read up to the latest 200
+  messages of that same channel, including messages that did not mention it, if
+  the request depends on earlier discussion.
 - Bot interaction metadata, logs, and session context needed for operation,
   debugging, abuse prevention, and access control.
 - Direct-message text and attachment metadata. Direct-message attachments are
@@ -48,8 +51,9 @@ Data is used only to operate ChatBird, provide requested replies, maintain
 conversation continuity, debug issues, and enforce access control.
 
 Message content, relevant context, and supported attachments may be sent to
-Xiaomi MiMo API to generate responses. Discord data is not sold, not used for
-advertising, and not used to train our own machine learning or AI models.
+Anthropic's API to generate responses, or to Xiaomi MiMo API when the main model
+is unavailable. Discord data is not sold, not used for advertising, and not used
+to train our own machine learning or AI models.
 
 ## Storage
 
@@ -67,8 +71,9 @@ Ordinary users cannot directly instruct ChatBird to write long-term memory.
 ChatBird may choose to retain stable preferences or user characteristics, but
 does not intentionally store ordinary users' task instructions, credentials,
 or prompt-injection text as memory. Ordinary users are also restricted to
-conversation, web lookup, supported attachment analysis, clarification, and
-the limited memory function described above. Sensitive agent tools and
+conversation, web lookup, supported attachment analysis, clarification, reading
+recent messages in the current channel, and the limited memory function
+described above. Sensitive agent tools and
 administrator memory are available only to the configured administrator in a
 designated private administrator channel.
 
@@ -83,8 +88,9 @@ administrators.
 ## User Choice
 
 Users can avoid directly invoking ChatBird by not mentioning or replying to it.
-When another user asks for a channel summary or supplies quoted context,
-relevant recent messages may still be processed. The bot is configured to
+When another user asks for a channel summary, supplies quoted context, or asks
+something that depends on earlier discussion, recent messages in that channel
+may still be processed. The bot is configured to
 respond only in allowed servers and channels and only when explicitly invoked.
 Sending a direct message does not invoke the assistant, but the message is
 still recorded as described above.
@@ -96,8 +102,8 @@ clarification about how ChatBird is used in the server.
 ## Data Sharing
 
 ChatBird may send user prompts, relevant context, and supported attachments to
-Xiaomi MiMo API to generate responses. We do not sell Discord data or share it
-with advertisers.
+Anthropic's API, or to Xiaomi MiMo API when the main model is unavailable, to
+generate responses. We do not sell Discord data or share it with advertisers.
 
 ## Contact
 

@@ -45,9 +45,24 @@ The double check keeps an administrator's sensitive tool results out of public
 shared transcripts. In a public channel, the administrator receives the same
 safe tool surface as every other participant.
 
+Inside the gateway, a tool call without a Discord identity is denied. A worker
+thread that lost its ContextVars reads exactly like the local CLI, so the
+`_HERMES_GATEWAY` process marker decides, not the identity. Cron is the one
+exception: the scheduler binds an empty platform and its `cron_` session IDs are
+not user input. As a result, `delegate_task` batch children have no tools. The
+local CLI keeps normal access.
+
+`session_search` is denied in every Discord and cron context, including the
+administrator channel, because it reads every Guild's transcripts.
+
 Public policy permits only `web_search`, `web_extract`, `vision_analyze`,
-`clarify`, `skills_list`, `skill_view`, and constrained `chatbird_memory`
-profile operations when those tools are registered. `skills_list` and
+`clarify`, `skills_list`, `skill_view`, `chatbird_channel_history`, and
+constrained `chatbird_memory` profile operations when those tools are
+registered. `chatbird_channel_history` reads at most the latest 200 messages of
+the current channel through Discord REST. The channel comes from the request
+identity and never from a model argument, and it must belong to the current
+Guild. Results are marked as untrusted data. Inside a thread it reads only that
+thread. `skills_list` and
 `skill_view` expose only independently reviewed public skills whose current
 files still match the approved SHA-256 digest. Public reads are inert: no
 template expansion, inline command execution, credential setup, or host-path

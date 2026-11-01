@@ -88,6 +88,12 @@ Claude Code OAuth identity transforms (system-prompt prefix, product-name
 rewrites, `mcp__` tool renames, CLI user agent). Upstream Hermes still treats
 every other `sk-ant-*` prefix as an OAuth token as of 2026-10-09.
 
+The vision redirect patch backports upstream `500c2b1e46`. The old SSRF guards
+tested `response.next_request`, which httpx leaves unset inside response hooks,
+so a public URL could redirect a `vision_analyze` download to an internal
+address. The guards now read the `Location` header. Drop this patch when the
+base commit moves past that upstream fix.
+
 `hermes-gateway-browser.conf` is the tracked systemd drop-in for the stable
 local Chromium launcher. Install it under
 `/etc/systemd/system/hermes-gateway.service.d/`, then reload systemd. Keep the

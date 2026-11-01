@@ -1,0 +1,207 @@
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+index 8dd9fc8fdd..09a3a16016 100644
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -546,13 +546,12 @@ async def _ssrf_redirect_guard(response):
+ 
+     Must be async because httpx.AsyncClient awaits response event hooks.
+     """
+-    if response.is_redirect and response.next_request:
+-        redirect_url = str(response.next_request.url)
+-        from tools.url_safety import is_safe_url
+-        if not is_safe_url(redirect_url):
+-            raise ValueError(
+-                f"Blocked redirect to private/internal address: {safe_url_for_log(redirect_url)}"
+-            )
++    from tools.url_safety import is_safe_url, redirect_target_from_response
++    redirect_url = redirect_target_from_response(response)
++    if redirect_url and not is_safe_url(redirect_url):
++        raise ValueError(
++            f"Blocked redirect to private/internal address: {safe_url_for_log(redirect_url)}"
++        )
+ 
+ 
+ # ---------------------------------------------------------------------------
+diff --git a/plugins/platforms/slack/adapter.py b/plugins/platforms/slack/adapter.py
+index 60f510d707..b5e7a2ed40 100644
+--- a/plugins/platforms/slack/adapter.py
++++ b/plugins/platforms/slack/adapter.py
+@@ -1930,10 +1930,10 @@ class SlackAdapter(BasePlatformAdapter):
+ 
+             async def _ssrf_redirect_guard(response):
+                 """Re-check redirect targets so public URLs cannot bounce into private IPs."""
+-                if response.is_redirect and response.next_request:
+-                    redirect_url = str(response.next_request.url)
+-                    if not is_safe_url(redirect_url):
+-                        raise ValueError("Blocked redirect to private/internal address")
++                from tools.url_safety import redirect_target_from_response
++                redirect_url = redirect_target_from_response(response)
++                if redirect_url and not is_safe_url(redirect_url):
++                    raise ValueError("Blocked redirect to private/internal address")
+ 
+             # Download the image first
+             async with httpx.AsyncClient(
+diff --git a/tests/tools/test_url_safety.py b/tests/tools/test_url_safety.py
+index dc5a7e52ac..1745d98d02 100644
+--- a/tests/tools/test_url_safety.py
++++ b/tests/tools/test_url_safety.py
+@@ -8,6 +8,7 @@ from tools.url_safety import (
+     async_is_safe_url,
+     is_always_blocked_url,
+     normalize_url_for_request,
++    redirect_target_from_response,
+     _is_blocked_ip,
+     _global_allow_private_urls,
+     _reset_allow_private_cache,
+@@ -629,3 +630,62 @@ class TestIPv4MappedIPv6SSRF:
+             (10, 1, 6, "", ("::ffff:100.100.100.200", 0, 0, 0)),
+         ]):
+             assert is_safe_url("http://aliyun-metadata.internal/") is False
++
++
++class _FakeResponse:
++    """Minimal stand-in for an httpx response as seen inside a response hook."""
++
++    def __init__(self, *, is_redirect, location=None, url="", next_request=None):
++        self.is_redirect = is_redirect
++        self.headers = {"location": location} if location else {}
++        self.url = url
++        self.next_request = next_request
++
++
++class _FakeNextRequest:
++    def __init__(self, url):
++        self.url = url
++
++
++class TestRedirectTargetFromResponse:
++    """redirect_target_from_response is the SSRF-guard boundary for httpx hooks.
++
++    Inside httpx AsyncClient response hooks, ``response.next_request`` is often
++    ``None`` even for a real redirect, so a guard keyed only on it silently
++    never fires. Resolving from the ``Location`` header closes that hole.
++    """
++
++    def test_absolute_location_without_next_request(self):
++        # The exact bypass: redirect present, next_request unset, private target.
++        resp = _FakeResponse(
++            is_redirect=True,
++            location="http://169.254.169.254/latest/meta-data",
++            url="https://public.example/image.png",
++        )
++        assert (
++            redirect_target_from_response(resp)
++            == "http://169.254.169.254/latest/meta-data"
++        )
++
++    def test_relative_location_is_resolved_against_response_url(self):
++        resp = _FakeResponse(
++            is_redirect=True,
++            location="/redir",
++            url="https://public.example/image.png",
++        )
++        assert redirect_target_from_response(resp) == "https://public.example/redir"
++
++    def test_non_redirect_returns_none(self):
++        resp = _FakeResponse(is_redirect=False, location="http://169.254.169.254/")
++        assert redirect_target_from_response(resp) is None
++
++    def test_falls_back_to_next_request_when_no_location(self):
++        resp = _FakeResponse(
++            is_redirect=True,
++            next_request=_FakeNextRequest("http://10.0.0.1/meta"),
++        )
++        assert redirect_target_from_response(resp) == "http://10.0.0.1/meta"
++
++    def test_no_location_no_next_request_returns_none(self):
++        resp = _FakeResponse(is_redirect=True)
++        assert redirect_target_from_response(resp) is None
+diff --git a/tools/url_safety.py b/tools/url_safety.py
+index 32b0d3bddf..953bae19dd 100644
+--- a/tools/url_safety.py
++++ b/tools/url_safety.py
+@@ -28,7 +28,8 @@ import logging
+ import os
+ import socket
+ import asyncio
+-from urllib.parse import quote, urlparse, urlsplit, urlunsplit
++from typing import Any, Optional
++from urllib.parse import quote, urljoin, urlparse, urlsplit, urlunsplit
+ 
+ from utils import is_truthy_value
+ 
+@@ -407,3 +408,30 @@ async def async_is_safe_url(url: str) -> bool:
+     ``web_extract_tool``, vision download hooks) instead of ``is_safe_url``.
+     """
+     return await asyncio.to_thread(is_safe_url, url)
++
++
++def redirect_target_from_response(response: Any) -> Optional[str]:
++    """Return the redirect target visible from inside an httpx response hook.
++
++    In ``httpx.AsyncClient`` response event hooks, ``response.next_request`` is
++    frequently ``None`` even for a genuine redirect (it is populated later by
++    the redirect-following machinery). Relying on ``next_request`` alone means
++    an SSRF redirect guard silently never fires: a public URL that 302s to
++    ``http://169.254.169.254/`` gets followed anyway. The ``Location`` header,
++    however, is already present on the response, so resolve the target from it
++    first (handling relative Locations via ``urljoin``) and only fall back to
++    ``next_request`` when no ``Location`` header is set.
++    """
++    if not getattr(response, "is_redirect", False):
++        return None
++
++    headers = getattr(response, "headers", {}) or {}
++    location = headers.get("location")
++    if location:
++        return urljoin(str(getattr(response, "url", "")), str(location))
++
++    next_request = getattr(response, "next_request", None)
++    if next_request:
++        return str(next_request.url)
++
++    return None
+diff --git a/tools/vision_tools.py b/tools/vision_tools.py
+index cfc933dae0..827c835dae 100644
+--- a/tools/vision_tools.py
++++ b/tools/vision_tools.py
+@@ -180,13 +180,12 @@ async def _download_image(image_url: str, destination: Path, max_retries: int =
+ 
+         Must be async because httpx.AsyncClient awaits event hooks.
+         """
+-        if response.is_redirect and response.next_request:
+-            redirect_url = str(response.next_request.url)
+-            from tools.url_safety import async_is_safe_url
+-            if not await async_is_safe_url(redirect_url):
+-                raise ValueError(
+-                    f"Blocked redirect to private/internal address: {redirect_url}"
+-                )
++        from tools.url_safety import async_is_safe_url, redirect_target_from_response
++        redirect_url = redirect_target_from_response(response)
++        if redirect_url and not await async_is_safe_url(redirect_url):
++            raise ValueError(
++                f"Blocked redirect to private/internal address: {redirect_url}"
++            )
+ 
+     last_error = None
+     for attempt in range(max_retries):
+@@ -1268,13 +1267,12 @@ async def _download_video(video_url: str, destination: Path, max_retries: int =
+     destination.parent.mkdir(parents=True, exist_ok=True)
+ 
+     async def _ssrf_redirect_guard(response):
+-        if response.is_redirect and response.next_request:
+-            redirect_url = str(response.next_request.url)
+-            from tools.url_safety import async_is_safe_url
+-            if not await async_is_safe_url(redirect_url):
+-                raise ValueError(
+-                    f"Blocked redirect to private/internal address: {redirect_url}"
+-                )
++        from tools.url_safety import async_is_safe_url, redirect_target_from_response
++        redirect_url = redirect_target_from_response(response)
++        if redirect_url and not await async_is_safe_url(redirect_url):
++            raise ValueError(
++                f"Blocked redirect to private/internal address: {redirect_url}"
++            )
+ 
+     last_error = None
+     for attempt in range(max_retries):
