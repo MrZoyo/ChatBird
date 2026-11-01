@@ -1,6 +1,6 @@
 # ChatBird 生产状态与修改总览
 
-模型与服务状态最后核对：2026-10-11（Europe/Berlin）。其他功能的历史验证日期见各节。
+模型与服务状态最后核对：2026-11-01（Europe/Berlin）。其他功能的历史验证日期见各节。
 
 这份文档是 ChatBird 当前生产部署的非敏感总览，用于在仓库长期休眠后快速恢复上下文。它记录架构、ID 映射、安全边界、Hermes 补丁和验证方式，但不保存 API Key、Bot Token 或其他凭据。
 
@@ -20,6 +20,38 @@
 生产机只有约 1.6 GiB 内存。只能做定向读取、单文件测试和短日志检查；不要在生产机运行全仓扫描、完整测试套件、高并发构建或无必要升级。不要打印、复制到日志或提交 `/root/.hermes/.env` 的实际值。
 
 本地非敏感配置镜像是 [`../patches/chatbird-production-config.yaml`](../patches/chatbird-production-config.yaml)，环境变量格式参考 [`../.env.example`](../.env.example)。
+
+### 2026-11-01 Anthropic Key 轮换
+
+用户换用一把带限制的新 `sk-ant-usr-` Key。只改 `.env` 中 `ANTHROPIC_API_KEY` 这一行，
+模型和配置不变。`auth.json` 的凭据池不保存 Key 本身，只保存 `env:ANTHROPIC_API_KEY`
+引用和指纹，加载时从 `.env` 重新读取，因此不需要手改。
+
+具体限制在创建 Key 时设置，这里无法读取。API 响应头只显示速率上限（请求 13,000、
+输入 token 10,000,000、输出 token 2,000,000），看不到消费限额。生产没有配置
+`fallback_model`，Key 达到限额后 Bot 会报错，不会自动切到 `XIAOMI_API_KEY`。
+
+验证结果：
+
+- 替换前在生产机用新 Key 串行烟测 `claude-sonnet-5-5`：文本 1.52 秒；流式 1.16 秒；
+  合成工具调用及结果回传合计约 2.8 秒，未执行外部工具；合成纯红 PNG 识别为 `RED`，
+  1.21 秒。
+- 网关于 20:29:30 CET 重启，新 PID 为 `760278`，20:29:40 确认 Discord 已连接
+  （状态文件 PID 与 `MainPID` 一致），服务为 `active/running`、`NRestarts=0`。
+  重启后日志没有认证错误。旧进程收到 SIGTERM 后以状态 1 退出，与前几次切换相同。
+- 按生产配置解析：主 runtime 为 `anthropic` / `anthropic_messages` /
+  `https://api.anthropic.com`，读取新 Key，认证方式为 `x-api-key`，实际调用返回
+  `MAIN_OK`，1.29 秒。压缩、标题生成、网页摘要和视觉客户端均为 `claude-sonnet-5-5`；
+  标题生成客户端实际调用返回 `PROD_OK`，1.19 秒。
+- 凭据池条目的 `auth_type` 仍显示 `oauth`：`credential_pool.py` 把 `sk-ant-api` 以外的
+  前缀都这样标记，补丁未改动此处。实际认证由 `anthropic_adapter.py` 决定，已确认不走 OAuth。
+
+这些是简短 API 烟测，不是 Discord 用户侧的对话验收。
+
+替换前备份（仅生产机，目录权限 `0700`）：
+`/root/.hermes/backups/anthropic-key-rotation-20261101T192930Z/`，包含 `.env` 和
+`auth.json`，其中有旧 Key。`config.yaml` 未修改，SHA-256 为
+`884e68901e7e54e0b0b752caf271c063f897a68f6518154ba47c595264895bac`。
 
 ### 2026-10-11 Claude Sonnet 5.5 切换
 
