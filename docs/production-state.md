@@ -56,7 +56,9 @@ OOMPolicy=continue
 - 第一次重启：Discord 断开约 11 秒。维护流程跑了一次，配置 SHA 不变，`/usr/local/bin/hermes` 不变。`errors.log` 多一条预期内的 `config migration skipped`。
 - 第二次重启：9 秒连上，维护流程没有再跑，没有新警告，`NRestarts=0`，journal 0 条错误，最终 PID `784589`。
 
-未验证：Discord 里的 `/version` 显示；运行中的网关实际触发 Chromium 回退（只在相同设置的临时单元里测过）；1200M 限额下真实超限（只用小限额测过）。
+Discord 验收：用户确认 `/version` 显示正常。
+
+未验证：运行中的网关实际触发 Chromium 回退（只在相同设置的临时单元里测过）；1200M 限额下真实超限（只用小限额测过）。
 网关加一个重页面后余量不大，观察 `/sys/fs/cgroup/system.slice/hermes-gateway.service/memory.events` 的 `oom_kill`。
 
 回滚（两项可以分开做）：
