@@ -77,7 +77,7 @@ Discord 验收：用户当天按升级文档的 7 项清单操作，全部通过
 未验证：真实额度耗尽时的错误文本。
 
 已知问题：`hermes --version` 和 Discord `/version` 显示 `vunknown`，模型请求的 User-Agent 是 `HermesAgent/unknown`。发布包没有 `install-stamp.json`，也不是 Git 工作树，Hermes 读不到版本。实际版本看 `CHATBIRD_RELEASE`。
-目前没有插件声明 `requires_hermes`，模型请求也正常，所以只影响显示。修法见升级文档。
+目前没有插件声明 `requires_hermes`，模型请求也正常，所以只影响显示。用户决定下次重启网关时一起修，修法见升级文档。
 
 部署前备份（仅生产机，目录权限 `0700`）：
 `/root/.hermes/backups/hermes-0.22.5-20261102T112302Z/`，含 `state.db`（schema 16）、`.env`、`auth.json`、配置、插件 1.5.0、校验脚本、记忆、会话和 Skill。

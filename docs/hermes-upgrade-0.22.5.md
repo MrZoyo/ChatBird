@@ -281,7 +281,7 @@ Discord 验收（2026-11-02 用户操作，全部通过）：
 
 ### 已知问题：版本显示 `vunknown`
 
-Hermes 从 `install-stamp.json` 或 Git 读版本，发布包两者都没有，所以 `/version` 显示 `vunknown`，User-Agent 是 `HermesAgent/unknown`。只影响显示，生产上没有修。
+Hermes 从 `install-stamp.json` 或 Git 读版本，发布包两者都没有，所以 `/version` 显示 `vunknown`，User-Agent 是 `HermesAgent/unknown`。只影响显示。用户决定下次重启网关时一起修，所以下次计划重启前先做这一项。
 
 修法：`build-hermes-release.sh` 调用上游的 `scripts/write_install_stamp.py`，传 `--base-version`、`--commit` 和 `--update-mechanism external`。网关启动时才读版本，所以要到下次重启才生效。
 `boot_bootstrap`、`source_check`、`venv_sync` 也读这个文件，改之前先在本地发布包上验证启动和这些路径，不要直接写到生产目录。
