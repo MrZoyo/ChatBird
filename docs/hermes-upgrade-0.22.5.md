@@ -1,6 +1,6 @@
 # Hermes 升级到 v0.22.5
 
-状态：2026-11-02 已部署到生产，等 Discord 实际对话验收。部署记录和验证结果在
+状态：2026-11-02 已部署到生产，用户当天在 Discord 验收通过。部署记录和验证结果在
 [`production-state.md`](production-state.md)，这里是去留清单和方案。
 
 | 项目 | 旧 | 新 |
@@ -250,7 +250,7 @@ systemctl daemon-reload
 systemctl start hermes-gateway.service
 ```
 
-`/usr/local/bin/hermes` 这个软链接在确认运行稳定后再改到 `venv-3.14.7/bin/hermes`，改之前管理命令还是旧版本。
+`/usr/local/bin/hermes` 这个软链接在 Discord 验收后再改到 `venv-3.14.7/bin/hermes`，改之前管理命令还是旧版本（2026-11-02 已改）。
 
 ### 重启后检查
 
@@ -264,7 +264,7 @@ free -m
 要确认：Discord 已连接，`NRestarts=0`，日志没有 `chatbird-policy` 加载错误，也没有 `linked SQLite` 警告，`MemoryCurrent` 低于 800 MiB，公开审批 Skill 仍可见
 （`gaming-references`），全局 Slash 命令里 `/help`、`/whoami`、`/status`、`/version`、`/usage` 还在。
 
-Discord 验收（需要你在频道里操作）：
+Discord 验收（2026-11-02 用户操作，全部通过）：
 
 1. 公开频道 `@Bot 你好`，模型回复；工具进度卡片不出现。
 2. 公开频道 `@Bot /restart`，**不应**重启，网关 PID 不变。
@@ -276,8 +276,15 @@ Discord 验收（需要你在频道里操作）：
 
 ### 观察与清理
 
-观察 7 天再删旧目录和备份。期间关注 RSS、`journalctl` 的 `Hook .* timed out`、`/root/.hermes/cache/web` 的大小。
+观察到 2026-11-09 再删旧目录和备份。期间关注 RSS、`journalctl` 的 `Hook .* timed out`、`/root/.hermes/cache/web` 的大小。
 新版本把被截断网页的全文存到 `cache/web`，这是新增的磁盘占用。
+
+### 已知问题：版本显示 `vunknown`
+
+Hermes 从 `install-stamp.json` 或 Git 读版本，发布包两者都没有，所以 `/version` 显示 `vunknown`，User-Agent 是 `HermesAgent/unknown`。只影响显示，生产上没有修。
+
+修法：`build-hermes-release.sh` 调用上游的 `scripts/write_install_stamp.py`，传 `--base-version`、`--commit` 和 `--update-mechanism external`。网关启动时才读版本，所以要到下次重启才生效。
+`boot_bootstrap`、`source_check`、`venv_sync` 也读这个文件，改之前先在本地发布包上验证启动和这些路径，不要直接写到生产目录。
 
 ## 回滚方案
 
@@ -285,6 +292,7 @@ Discord 验收（需要你在频道里操作）：
 systemctl stop hermes-gateway.service
 rm /etc/systemd/system/hermes-gateway.service.d/release.conf
 systemctl daemon-reload
+ln -sfn /usr/local/lib/hermes-agent/venv/bin/hermes /usr/local/bin/hermes
 systemctl start hermes-gateway.service
 ```
 

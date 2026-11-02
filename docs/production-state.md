@@ -11,6 +11,7 @@
 | SSH 主机别名 | `aliyun-germany`（端口 `22222`；`22` 由云防火墙限制来源 IP） |
 | Hermes 源码 | `/usr/local/lib/hermes-agent-0.22.5`（v0.22.5 加补丁栈，不是 Git 工作树，版本见其中的 `CHATBIRD_RELEASE`） |
 | Python 环境 | 上面目录下的 `venv-3.14.7`，由 systemd drop-in `release.conf` 指定 |
+| 管理命令 | `/usr/local/bin/hermes`，软链接到上面环境的 `bin/hermes` |
 | 旧版本 | `/usr/local/lib/hermes-agent`（v0.17，未改动，回滚用） |
 | Hermes 配置 | `/root/.hermes/config.yaml` |
 | Hermes 环境变量 | `/root/.hermes/.env`，权限应为 `0600` |
@@ -58,7 +59,7 @@ security:
   allow_lazy_installs: false
 ```
 
-`/usr/local/bin/hermes` 还指向旧版本，确认稳定后改到新环境。
+用户验收后，`/usr/local/bin/hermes` 于 15:12 CET 改到新环境，网关没有重启。`hermes update` 在这个目录上直接拒绝（不是 Git 工作树），不会覆盖补丁。
 
 验证结果：
 
@@ -71,10 +72,12 @@ security:
   Guild 记忆、用户画像、私信日志都不可发送。`.env` 的 `HERMES_MEDIA_*` 行数为 0。
 - 两次切换的停机都约 2 秒，最终 PID `773455`（12:27:16 CET 启动）。RSS 约 230 MiB，旧版本约 135 MiB。
 
-未验证：
+Discord 验收：用户当天按升级文档的 7 项清单操作，全部通过。生产侧核对（15:12 CET）：PID 仍是 `773455`，`NRestarts=0`，启动以来 0 条 ERROR，私信日志在 15:10 CET 有新写入。
 
-- 未在 Discord 实际对话验收，清单见升级文档。
-- 真实额度耗尽时的错误文本。
+未验证：真实额度耗尽时的错误文本。
+
+已知问题：`hermes --version` 和 Discord `/version` 显示 `vunknown`，模型请求的 User-Agent 是 `HermesAgent/unknown`。发布包没有 `install-stamp.json`，也不是 Git 工作树，Hermes 读不到版本。实际版本看 `CHATBIRD_RELEASE`。
+目前没有插件声明 `requires_hermes`，模型请求也正常，所以只影响显示。修法见升级文档。
 
 部署前备份（仅生产机，目录权限 `0700`）：
 `/root/.hermes/backups/hermes-0.22.5-20261102T112302Z/`，含 `state.db`（schema 16）、`.env`、`auth.json`、配置、插件 1.5.0、校验脚本、记忆、会话和 Skill。
