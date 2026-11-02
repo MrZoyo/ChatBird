@@ -197,7 +197,7 @@ public channel fail closed.
 
 The repository includes a public-channel policy for web queries. Operators can
 choose the search and content-extraction backends for each deployment. Public
-web access does not grant terminal, file, code-execution, or interactive
+web access does not grant terminal, file, local code-execution, or interactive
 browser capabilities.
 
 ## Troubleshooting

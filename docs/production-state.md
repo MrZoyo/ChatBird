@@ -1,6 +1,6 @@
 # ChatBird 生产状态与修改总览
 
-模型与服务状态最后核对：2026-11-01（Europe/Berlin）。其他功能的历史验证日期见各节。
+模型与服务状态最后核对：2026-11-02（Europe/Berlin）。其他功能的历史验证日期见各节。
 
 这份文档是 ChatBird 当前生产部署的非敏感总览，用于在仓库长期休眠后快速恢复上下文。它记录架构、ID 映射、安全边界、Hermes 补丁和验证方式，但不保存 API Key、Bot Token 或其他凭据。
 
@@ -16,11 +16,72 @@
 | systemd 服务 | `hermes-gateway.service` |
 | 模型 | Anthropic Claude Sonnet 5.5 `claude-sonnet-5-5`（主模型、文本辅助任务和图片分析） |
 | 备用模型 | Xiaomi `mimo-v2.6-flash`（主模型调用失败时切换；图片分析不跟随） |
-| 策略插件 | `chatbird-policy` `1.4.0` |
+| 策略插件 | `chatbird-policy` `1.5.0` |
 
 生产机只有约 1.6 GiB 内存。只能做定向读取、单文件测试和短日志检查；不要在生产机运行全仓扫描、完整测试套件、高并发构建或无必要升级。不要打印、复制到日志或提交 `/root/.hermes/.env` 的实际值。
 
 本地非敏感配置镜像是 [`../patches/chatbird-production-config.yaml`](../patches/chatbird-production-config.yaml)，环境变量格式参考 [`../.env.example`](../.env.example)。
+
+### 2026-11-02 远程代码执行与文件发送收紧
+
+用户已在 Discord 确认频道历史和图片分析正常，这是 11 月 1 日部署的用户侧验收。下一步在 Hermes 升级和代码
+执行之间先做代码执行：它只是一个插件工具，不动 Hermes 核心，以后升级不用为它解冲突。私聊和关闭 SSH 密码
+登录由用户决定暂不做。部署前由 Fable subagent 做了只读安全审查。
+
+- **`chatbird_run_code`（公开工具）：** 用单独的 Anthropic 请求调用托管的 `code_execution_20260521`，代码在
+  Anthropic 的容器里运行，没有外网，也碰不到这台服务器。工具只接受 `task` 字符串（上限 4 万字符），所以数据
+  要写进去；用户上传的附件目前不会传进沙箱。每次调用都开新容器，容器 ID 只用于在同一次调用内恢复
+  `pause_turn`，防止文件跨 Guild。单次调用最多 3 个请求，每个超时 150 秒，SDK 不重试（重试会让代码再跑一遍）。
+  生成文件只从 API 的工具结果块里取，扩展名白名单，最多 4 个、每个 8 MiB，每次最多检查 8 个文件 ID；写入
+  Hermes 文档缓存（24 小时后清理），并尽力从 Anthropic 文件存储删除。工具返回 `MEDIA:` 行，由主模型写进回复。
+  这个工具不在 Hermes 的自动附加名单里，所以代码打印的 `MEDIA:` 字符串不会触发上传。
+- **文件发送严格模式：** 回复里的 `MEDIA:` 行或本地路径会让网关把文件传到频道。Hermes 默认只拦一份简短的
+  凭据名单；网关以 root 运行时 `/root` 本身放行，所以实测会话 JSON、Guild 记忆、用户画像和 `SOUL.md` 都能被
+  发到公开频道，唯一的防线是模型自己拒绝。这是已有漏洞，会破坏 Guild 隔离，与代码执行无关，但代码输出多了
+  一条注入途径，所以一起修。现在 `gateway.strict: true` 加 `gateway.trust_recent_files: false`，只有 Hermes 的
+  缓存目录能发送。代价是管理员要发其他位置的文件时，得先复制到 `~/.hermes/cache/documents/`。
+
+```yaml
+gateway:
+  strict: true
+  trust_recent_files: false
+```
+
+Hermes 每回合用覆盖模式重载 `.env`，但只重新桥接 `max_turns`，所以 `.env` 里不能有 `HERMES_MEDIA_*`，否则会在第
+一回合后悄悄覆盖上面的配置。当前数量为 0。
+
+Fable 审查结论是可以部署，并发现两处已修复的问题：代码生成几百个文件时，文件 API 调用次数没有上限；SDK 重试
+会让代码跑两遍。
+
+成本：一次简单调用输入约 6,300、输出约 370 token，约 1.6 美分。输入主要是工具自带的提示词。容器时长每月
+1,550 小时内免费，之后每小时 0.05 美元。
+
+验证结果：
+
+- 本地：ChatBird 单元测试 54 项通过。用真实 Anthropic SDK 0.87.0 对本地模拟服务器验证了 `pause_turn` 的请求体、
+  文件元数据、下载和删除，以及严格模式下的路径判断。
+- 生产（重启前，独立进程）：`gateway.run` 导入后两个环境变量为 `1` 和 `0`，重载 `.env` 后不变；会话 JSON、
+  Guild 记忆、用户画像、`SOUL.md`、`.env` 都不可发送。用生产 Key 真实运行一次：计算斐波那契并生成 `fib.png`，
+  文件通过严格模式校验，`extract_media` 能识别，结果里没有 Key。
+- 生产（重启后）：Discord 平台工具解析包含 `chatbird_run_code`，共 22 个工具。网关于 01:07:50 CET 重启，新 PID 为
+  `764075`，Discord 已连接，`NRestarts=0`，日志没有新错误。
+
+未验证：
+
+- 未在 Discord 实际对话验收。生成文件依赖主模型照抄 `MEDIA:` 行，模型漏写时文件不会发出。
+- 无法在线上进程里直接读取严格模式的环境变量，上面的结论来自走同一启动代码的独立进程。
+- API 返回的容器 `expires_at` 约为 1 小时后，文档写容器保留 30 天。隐私政策按更长的 30 天写。
+
+升级 Hermes 时要重新确认：SDK 0.87.0 用的是 `client.beta.files`，新版 SDK 中其结构有破坏性变化，应改用
+`client.files`。
+
+部署前备份（仅生产机，目录权限 `0700`）：
+`/root/.hermes/backups/code-execution-20261102T000711Z/`。
+
+配置 SHA-256：
+
+- 部署前：`ef1a875d3ebebbc68fb9d295d0e4e4f840a22ac0a98407017a7ec5f20397a229`
+- 部署后：`8187250350a19b402aba3e0c28b12f5c45700b707a8fa33d546581830fb02c82`
 
 ### 2026-11-01 安全修复、频道历史与 MiMo 备用
 
@@ -342,7 +403,7 @@ auxiliary:
 
 ## 用户与管理员权限
 
-普通用户可以在允许的 Guild 和频道中聊天、提问、搜索网页、提取静态网页正文和进行视觉分析。生产使用无需密钥的 DDGS 搜索后端，以及无需密钥、按请求工作的 `simple-http` 静态 HTML/text/JSON/XML 提取后端。普通用户还能列出和读取经过独立审批、与当前文件 SHA-256 绑定的公开 Skill；未审批、被修改或无法验证的 Skill 不可见。公开读取不会执行 Skill 模板、内联命令或密钥初始化。普通用户还可以通过 `chatbird_channel_history` 让 Bot 读取当前频道最近最多 200 条消息。普通用户不能使用终端、文件、代码执行、内置记忆、会话搜索、Cron、Skill 管理、代理委派、跨平台消息、计算机控制或 Kanban 等敏感工具。`session_search` 在管理员频道和 cron 中同样禁用，因为它不按 Guild 过滤。
+普通用户可以在允许的 Guild 和频道中聊天、提问、搜索网页、提取静态网页正文和进行视觉分析。生产使用无需密钥的 DDGS 搜索后端，以及无需密钥、按请求工作的 `simple-http` 静态 HTML/text/JSON/XML 提取后端。普通用户还能列出和读取经过独立审批、与当前文件 SHA-256 绑定的公开 Skill；未审批、被修改或无法验证的 Skill 不可见。公开读取不会执行 Skill 模板、内联命令或密钥初始化。普通用户还可以通过 `chatbird_channel_history` 让 Bot 读取当前频道最近最多 200 条消息，通过 `chatbird_run_code` 让 Bot 在 Anthropic 托管的无外网沙箱里运行代码。普通用户不能使用终端、文件、本地代码执行、内置记忆、会话搜索、Cron、Skill 管理、代理委派、跨平台消息、计算机控制或 Kanban 等敏感工具。`session_search` 在管理员频道和 cron 中同样禁用，因为它不按 Guild 过滤。
 
 生产已启用透明本地 Chromium 回退：公开用户仍只调用 `web_search`/`web_extract`，主提供方遇到 403、5xx、超时、JS challenge 或空正文时，Hermes 在后台启动一个短时浏览器，执行固定 DOM 读取后立即关闭。全进程最多同时运行一个回退，单次最多处理两个页面，不向公开用户暴露点击、输入、登录、下载或任意 JavaScript 能力，也不会切换 IP 绕过 HTTP 429 限流。本地 Chromium 可以处理 JavaScript 渲染，但不能保证通过验证码、住宅 IP 或高级反检测挑战。
 
@@ -573,6 +634,9 @@ Chromium 后，应更新稳定入口并重新执行浏览器 requirements、公�
   解封后规则清空。fail2ban 常驻内存约 38 MiB。
 - 9 月 13 日以来的 auth 日志没有失败登录记录。
 - sshd 仍允许 root 使用密码登录（`PasswordAuthentication yes`），Hermes 安全审计也对此告警。
-  是否改为仅密钥登录待用户决定。
+
+2026-11-02 核对：过去 7 天有 2,009 次密码登录失败，来自 1,003 个 IP，其中 357 次针对 root。密码登录成功 0 次，公钥
+登录成功 27 次。只有 39 个 IP 失败达到 5 次，所以 fail2ban 拦不住大部分这种分散的尝试。用户决定暂不关闭密码登录，
+前提是 root 密码足够长且随机，并且没有在别处用过。
 
 误封自己时，通过阿里云控制台登录后执行 `fail2ban-client set sshd unbanip <IP>`。

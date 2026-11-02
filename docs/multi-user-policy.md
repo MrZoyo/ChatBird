@@ -56,9 +56,9 @@ local CLI keeps normal access.
 administrator channel, because it reads every Guild's transcripts.
 
 Public policy permits only `web_search`, `web_extract`, `vision_analyze`,
-`clarify`, `skills_list`, `skill_view`, `chatbird_channel_history`, and
-constrained `chatbird_memory` profile operations when those tools are
-registered. `chatbird_channel_history` reads at most the latest 200 messages of
+`clarify`, `skills_list`, `skill_view`, `chatbird_channel_history`,
+`chatbird_run_code`, and constrained `chatbird_memory` profile operations when
+those tools are registered. `chatbird_channel_history` reads at most the latest 200 messages of
 the current channel through Discord REST. The channel comes from the request
 identity and never from a model argument, and it must belong to the current
 Guild. Results are marked as untrusted data. Inside a thread it reads only that
@@ -70,7 +70,7 @@ disclosure is allowed. Production uses DDGS for no-key `web_search` and the
 request-driven `simple-http` provider for static HTML/text/JSON/XML extraction.
 Every other
 tool is denied at the pre-execution hook, including terminal, host-file access,
-code execution, built-in memory, session search, Cron, Skill management,
+local code execution, built-in memory, session search, Cron, Skill management,
 delegation, messaging, computer use, and Kanban tools. Discord slash commands
 use a separate fail-closed gate. `/help`, `/whoami`, `/status`, `/version`, and
 `/usage` are public inside allowed Guild channels. Every other built-in,
@@ -125,6 +125,37 @@ HSGuru but the primary results contain no HSGuru link, Hermes broadens it to a
 public-index-only HSGuru Meta/Decks query through DDGS's Yahoo index backend;
 an empty response may fall back once more to the general HSGuru index. Hermes
 keeps only HSGuru result URLs and never retries an explicit rate limit.
+
+## Remote Code And File Delivery
+
+`chatbird_run_code` makes a separate Anthropic request with the hosted
+`code_execution` tool. The code runs in Anthropic's container, which has no
+internet and no access to this server. The tool takes only a `task` string, so
+everything the code needs must be written into it. Every call starts a new
+container; a container ID is reused only to resume a paused request inside that
+same call, because a shared container would carry files between Guilds. Output is
+marked as untrusted data, like channel history.
+
+Generated files are accepted only from the API's own tool-result blocks, never
+from model text, and only with an allowlisted extension, up to 4 files of 8 MiB
+each. At most 8 file IDs are inspected per call, which bounds the API calls when
+code emits hundreds of files; any beyond that stay in Anthropic's store under this
+organization. Accepted files are written to Hermes's document cache, removed after
+24 hours by its housekeeping, and deleted from Anthropic's file store on a
+best-effort basis. The tool returns a `MEDIA:` line for each, and the main model must
+restate it in the reply: this plugin tool is not on Hermes's auto-append list, so
+a `MEDIA:` string printed by the code cannot trigger an upload by itself.
+
+A `MEDIA:` line or a bare local path in any reply makes the gateway upload that
+file to the channel. Hermes's default accepts almost any file outside a short
+denylist, which on this root-run gateway includes sessions and memory. Production
+therefore sets `gateway.strict: true` and `gateway.trust_recent_files: false`, so
+only Hermes's cache directories can be delivered. An administrator who wants a
+file from elsewhere must copy it into `~/.hermes/cache/documents/` first.
+
+Hermes reloads `.env` with override on every turn but re-bridges only `max_turns`.
+A `HERMES_MEDIA_*` line in `.env` would therefore silently override these settings
+after the first turn, so `.env` must not contain any.
 
 ## Layered Memory
 

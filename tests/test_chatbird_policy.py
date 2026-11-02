@@ -491,5 +491,275 @@ class ChannelHistoryTests(unittest.TestCase):
         self.assertNotIn("test-token", raw)
 
 
+class FakeAPIError(Exception):
+    pass
+
+
+class FakeAPIStatusError(FakeAPIError):
+    def __init__(self, status_code):
+        super().__init__(f"status {status_code} for test-key")
+        self.status_code = status_code
+
+
+class FakeResponse:
+    def __init__(self, content, stop_reason="end_turn", container_id="cntr_1"):
+        self.content = content
+        self.stop_reason = stop_reason
+        self.container = types.SimpleNamespace(id=container_id)
+
+    def model_dump(self):
+        return {"content": self.content}
+
+
+class FakeFiles:
+    def __init__(self, files):
+        self.files = files
+        self.deleted = []
+        self.downloaded = []
+
+    def retrieve_metadata(self, file_id):
+        filename, size = self.files[file_id]
+        return types.SimpleNamespace(filename=filename, size_bytes=size)
+
+    def download(self, file_id):
+        self.downloaded.append(file_id)
+        return types.SimpleNamespace(read=lambda: b"payload")
+
+    def delete(self, file_id):
+        self.deleted.append(file_id)
+
+
+def run_result(*file_ids, stdout="4\n", stderr="", return_code=0):
+    return {
+        "type": "bash_code_execution_tool_result",
+        "tool_use_id": "srvtoolu_1",
+        "content": {
+            "type": "bash_code_execution_result",
+            "stdout": stdout,
+            "stderr": stderr,
+            "return_code": return_code,
+            "content": [{"type": "bash_code_execution_output", "file_id": item} for item in file_ids],
+        },
+    }
+
+
+class RunCodeTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.responses = []
+        self.requests = []
+        self.files = FakeFiles({})
+        self.client_kwargs = []
+        self.file_options = []
+        test = self
+
+        class FakeAnthropic:
+            def __init__(self, **kwargs):
+                test.client_kwargs.append(kwargs)
+                self.messages = types.SimpleNamespace(create=self.create)
+                self.beta = types.SimpleNamespace(files=test.files)
+
+            def with_options(self, **kwargs):
+                test.file_options.append(kwargs)
+                return self
+
+            def create(self, **kwargs):
+                test.requests.append(kwargs)
+                response = test.responses.pop(0)
+                if isinstance(response, Exception):
+                    raise response
+                return response
+
+        anthropic = types.ModuleType("anthropic")
+        anthropic.Anthropic = FakeAnthropic
+        anthropic.APIError = FakeAPIError
+        anthropic.APIStatusError = FakeAPIStatusError
+
+        def cache_document_from_bytes(data, filename):
+            path = Path(self.temp.name) / f"doc_test_{filename}"
+            path.write_bytes(data)
+            return str(path)
+
+        base = types.ModuleType("gateway.platforms.base")
+        base.cache_document_from_bytes = cache_document_from_bytes
+        self.modules = patch.dict(
+            sys.modules,
+            {
+                "anthropic": anthropic,
+                "gateway": types.ModuleType("gateway"),
+                "gateway.platforms": types.ModuleType("gateway.platforms"),
+                "gateway.platforms.base": base,
+            },
+        )
+        self.modules.start()
+        self.env = patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}, clear=False)
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+        self.modules.stop()
+        self.temp.cleanup()
+
+    def call(self, task="add 2 and 2"):
+        return json.loads(MODULE._handle_run_code({"task": task}))
+
+    def test_returns_summary_and_output(self):
+        self.responses = [FakeResponse([run_result(), {"type": "text", "text": "The answer is 4."}])]
+        result = self.call()
+        self.assertTrue(result["success"])
+        self.assertEqual(result["summary"], "The answer is 4.")
+        self.assertIn("4", result["output"])
+        self.assertIn("untrusted", result["notice"])
+        self.assertEqual(result["files"], [])
+        self.assertEqual(self.requests[0]["tools"], [MODULE._CODE_TOOL])
+        self.assertEqual(self.requests[0]["model"], MODULE._CODE_MODEL)
+
+    def test_reports_failed_runs(self):
+        self.responses = [FakeResponse([run_result(stdout="", stderr="boom", return_code=1)])]
+        result = self.call()
+        self.assertIn("boom", result["output"])
+        self.assertIn("exit code 1", result["output"])
+
+    def test_rejects_invalid_tasks_without_calling_the_api(self):
+        self.assertFalse(self.call(task="   ")["success"])
+        self.assertFalse(self.call(task="x" * (MODULE._CODE_MAX_TASK_CHARS + 1))["success"])
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": ""}):
+            self.assertFalse(self.call()["success"])
+        self.assertEqual(self.requests, [])
+
+    def test_separate_calls_never_share_a_container(self):
+        self.responses = [FakeResponse([]), FakeResponse([])]
+        self.call()
+        self.call()
+        self.assertNotIn("container", self.requests[0])
+        self.assertNotIn("container", self.requests[1])
+
+    def test_pause_turn_resumes_the_same_container(self):
+        paused = [{"type": "server_tool_use", "id": "srvtoolu_1", "name": "bash_code_execution", "input": {}}]
+        self.responses = [FakeResponse(paused, "pause_turn"), FakeResponse([{"type": "text", "text": "done"}])]
+        result = self.call()
+        self.assertEqual(result["summary"], "done")
+        self.assertNotIn("incomplete", result)
+        self.assertEqual(self.requests[1]["container"], "cntr_1")
+        self.assertEqual(self.requests[1]["messages"][0]["role"], "user")
+        self.assertEqual(self.requests[1]["messages"][1], {"role": "assistant", "content": paused})
+
+    def test_pause_turn_stops_at_the_request_limit(self):
+        self.responses = [FakeResponse([], "pause_turn") for _ in range(MODULE._CODE_MAX_REQUESTS + 1)]
+        result = self.call()
+        self.assertEqual(result["incomplete"], "pause_turn")
+        self.assertEqual(len(self.requests), MODULE._CODE_MAX_REQUESTS)
+
+    def test_generated_file_is_cached_with_a_media_line_and_removed_remotely(self):
+        self.files.files = {"file_1": ("chart.png", 7)}
+        self.responses = [FakeResponse([run_result("file_1")])]
+        result = self.call()
+        self.assertEqual(len(result["files"]), 1)
+        self.assertTrue(result["files"][0].startswith("MEDIA:"))
+        path = Path(result["files"][0].removeprefix("MEDIA:"))
+        self.assertEqual(path.parent, Path(self.temp.name))
+        self.assertEqual(path.read_bytes(), b"payload")
+        self.assertEqual(self.files.deleted, ["file_1"])
+
+    def test_filename_cannot_escape_or_add_spaces(self):
+        self.files.files = {"file_1": ("../../etc/my chart.png", 7)}
+        self.responses = [FakeResponse([run_result("file_1")])]
+        path = Path(self.call()["files"][0].removeprefix("MEDIA:"))
+        self.assertEqual(path.parent, Path(self.temp.name))
+        self.assertEqual(path.name, "doc_test_my_chart.png")
+
+    def test_unsafe_oversized_and_excess_files_are_skipped_and_still_removed(self):
+        self.files.files = {
+            "html": ("page.html", 7),
+            "dotfile": ("..", 7),
+            "big": ("big.png", MODULE._CODE_MAX_FILE_BYTES + 1),
+        }
+        count = MODULE._CODE_MAX_FILES + 1
+        self.files.files.update({f"ok{i}": (f"ok{i}.png", 7) for i in range(count)})
+        self.responses = [FakeResponse([run_result(*self.files.files)])]
+        result = self.call()
+        self.assertEqual(len(result["files"]), MODULE._CODE_MAX_FILES)
+        self.assertIn("page.html", result["skipped_files"])
+        self.assertIn("big.png", result["skipped_files"])
+        self.assertIn(f"ok{count - 1}.png", result["skipped_files"])
+        self.assertNotIn("html", self.files.downloaded)
+        self.assertNotIn("big", self.files.downloaded)
+        self.assertEqual(len(self.files.deleted), len(self.files.files))
+
+    def test_file_api_calls_are_bounded_when_code_emits_many_files(self):
+        count = MODULE._CODE_MAX_FILE_CHECKS + 12
+        self.files.files = {f"file_{i}": (f"{i}.png", 7) for i in range(count)}
+        self.responses = [FakeResponse([run_result(*self.files.files)])]
+        result = self.call()
+        self.assertEqual(len(self.files.deleted), MODULE._CODE_MAX_FILE_CHECKS)
+        self.assertEqual(len(result["files"]), MODULE._CODE_MAX_FILES)
+        self.assertIn("12 more", result["skipped_files"])
+        self.assertEqual(self.file_options, [{"timeout": MODULE._CODE_FILE_TIMEOUT_SECONDS}])
+
+    def test_sdk_retries_are_off_so_code_never_runs_twice(self):
+        self.responses = [FakeResponse([])]
+        self.call()
+        self.assertEqual(self.client_kwargs[0]["max_retries"], 0)
+
+    def test_only_tool_results_can_name_files(self):
+        self.files.files = {"file_1": ("chart.png", 7)}
+        self.responses = [FakeResponse([{"type": "text", "text": "file_id file_1", "file_id": "file_1"}])]
+        self.assertEqual(self.call()["files"], [])
+        self.assertEqual(self.files.downloaded, [])
+
+    def test_output_is_capped(self):
+        self.responses = [FakeResponse([run_result(stdout="y" * (MODULE._CODE_MAX_OUTPUT_CHARS + 50))])]
+        result = self.call()
+        self.assertTrue(result["truncated"])
+        self.assertEqual(len(result["output"]), MODULE._CODE_MAX_OUTPUT_CHARS)
+
+    def test_api_errors_do_not_leak_the_key(self):
+        self.responses = [FakeAPIStatusError(400)]
+        raw = MODULE._handle_run_code({"task": "x"})
+        self.assertFalse(json.loads(raw)["success"])
+        self.assertIn("HTTP 400", raw)
+        self.assertNotIn("test-key", raw)
+
+    def test_files_from_a_paused_run_are_removed_when_the_next_request_fails(self):
+        self.files.files = {"file_1": ("chart.png", 7)}
+        self.responses = [FakeResponse([run_result("file_1")], "pause_turn"), FakeAPIError("timeout")]
+        result = self.call()
+        self.assertFalse(result["success"])
+        self.assertEqual(self.files.deleted, ["file_1"])
+
+    def test_public_gate_and_prompt_expose_the_tool(self):
+        env = {
+            "HERMES_SESSION_PLATFORM": "discord",
+            "HERMES_SESSION_USER_ID": "42",
+            "HERMES_SESSION_CHAT_ID": "100",
+            "HERMES_SESSION_KEY": "agent:main:discord:group:100:guild-200",
+        }
+        with tempfile.TemporaryDirectory() as home, patch.dict(os.environ, {**env, "HERMES_HOME": home}):
+            self.assertIsNone(MODULE._on_pre_tool_call("chatbird_run_code"))
+            self.assertEqual(MODULE._on_pre_tool_call("execute_code")["action"], "block")
+            context = MODULE._on_pre_llm_call(user_message="hi", platform="discord")["context"]
+        self.assertIn("chatbird_run_code", context)
+        self.assertIn("Never write a MEDIA: line with any other path", context)
+
+    def test_gateway_without_identity_cannot_run_code(self):
+        cleared = {
+            name: ""
+            for name in (
+                "HERMES_SESSION_PLATFORM",
+                "HERMES_SESSION_USER_ID",
+                "HERMES_SESSION_CHAT_ID",
+                "HERMES_SESSION_KEY",
+            )
+        }
+        with patch.dict(os.environ, {**cleared, "_HERMES_GATEWAY": "1"}):
+            self.assertEqual(MODULE._on_pre_tool_call("chatbird_run_code")["action"], "block")
+
+    def test_schema_takes_only_a_task(self):
+        ctx = FakePluginContext()
+        MODULE.register(ctx)
+        schema = ctx.tools["chatbird_run_code"]["schema"]["parameters"]
+        self.assertEqual(list(schema["properties"]), ["task"])
+
+
 if __name__ == "__main__":
     unittest.main()

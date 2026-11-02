@@ -1,6 +1,6 @@
 # ChatBird Privacy Policy
 
-Last updated: 2026-11-01
+Last updated: 2026-11-02
 
 ChatBird is a Discord assistant available only in servers approved by its
 operator. It is powered by Hermes Agent, with Anthropic Claude as its main model
@@ -55,6 +55,14 @@ Anthropic's API to generate responses, or to Xiaomi MiMo API when the main model
 is unavailable. Discord data is not sold, not used for advertising, and not used
 to train our own machine learning or AI models.
 
+When a request needs a calculation, chart, or generated file, ChatBird may send
+the data for that task to Anthropic's hosted code sandbox. The sandbox has no
+internet access and no access to the bot's server, and each request uses a new
+one. Anthropic may keep a sandbox and its contents for up to 30 days. Generated
+files pass through Anthropic's file storage, which ChatBird clears on a
+best-effort basis after download, stay on the bot's server for about 24 hours,
+and are posted to the channel that asked for them.
+
 ## Storage
 
 ChatBird may store conversation context, selected long-term memory, logs, and
@@ -72,8 +80,9 @@ ChatBird may choose to retain stable preferences or user characteristics, but
 does not intentionally store ordinary users' task instructions, credentials,
 or prompt-injection text as memory. Ordinary users are also restricted to
 conversation, web lookup, supported attachment analysis, clarification, reading
-recent messages in the current channel, and the limited memory function
-described above. Sensitive agent tools and
+recent messages in the current channel, running code in the remote sandbox
+described above, and the limited memory function described above. Sensitive
+agent tools and
 administrator memory are available only to the configured administrator in a
 designated private administrator channel.
 

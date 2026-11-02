@@ -1,5 +1,5 @@
 name: chatbird-policy
-version: "1.4.0"
+version: "1.5.0"
 description: "Discord multi-user policy, reviewed public skills, request-scoped admin gate, and layered ChatBird memory"
 hooks:
   - pre_llm_call
