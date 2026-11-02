@@ -37,6 +37,7 @@ class ProductionConfigGuardTests(unittest.TestCase):
             "gateway": {"strict": True, "trust_recent_files": False},
             "web": {"keyless_fallback": False, "keyless_rescue": False},
             "tools": {"tool_search": {"enabled": "off"}},
+            "browser": {"backend": "off"},
             "security": {"allow_lazy_installs": False},
             "secrets": {"token": "must-stay-unchanged"},
         }
@@ -78,6 +79,7 @@ class ProductionConfigGuardTests(unittest.TestCase):
             "keyless_rescue": {"web": {"keyless_fallback": False}},
             "keyless_fallback": {"web": {"keyless_rescue": False}},
             "tool_search": {"tools": {}},
+            "browser": {"browser": {}},
             "allow_lazy_installs": {"security": {}},
             "write_approval": {"memory": {"user_profile_enabled": False, "write_approval": True}},
         }

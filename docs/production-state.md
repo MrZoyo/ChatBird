@@ -9,25 +9,80 @@
 | 项目 | 当前值 |
 |---|---|
 | SSH 主机别名 | `aliyun-germany`（端口 `22222`；`22` 由云防火墙限制来源 IP） |
-| Hermes 源码 | `/usr/local/lib/hermes-agent` |
+| Hermes 源码 | `/usr/local/lib/hermes-agent-0.22.5`（v0.22.5 加补丁栈，不是 Git 工作树，版本见其中的 `CHATBIRD_RELEASE`） |
+| Python 环境 | 上面目录下的 `venv-3.14.7`，由 systemd drop-in `release.conf` 指定 |
+| 旧版本 | `/usr/local/lib/hermes-agent`（v0.17，未改动，回滚用） |
 | Hermes 配置 | `/root/.hermes/config.yaml` |
 | Hermes 环境变量 | `/root/.hermes/.env`，权限应为 `0600` |
 | ChatBird 身份提示词 | `/root/.hermes/SOUL.md` |
 | systemd 服务 | `hermes-gateway.service` |
 | 模型 | Anthropic Claude Sonnet 5.5 `claude-sonnet-5-5`（主模型、文本辅助任务和图片分析） |
 | 备用模型 | Xiaomi `mimo-v2.6-flash`（主模型调用失败时切换；图片分析不跟随） |
-| 策略插件 | `chatbird-policy` `1.5.0` |
+| 策略插件 | `chatbird-policy` `1.6.0` |
 
 生产机只有约 1.6 GiB 内存。只能做定向读取、单文件测试和短日志检查；不要在生产机运行全仓扫描、完整测试套件、高并发构建或无必要升级。不要打印、复制到日志或提交 `/root/.hermes/.env` 的实际值。
 
 本地非敏感配置镜像是 [`../patches/chatbird-production-config.yaml`](../patches/chatbird-production-config.yaml)，环境变量格式参考 [`../.env.example`](../.env.example)。
 
-### 待部署：Hermes v0.22.5（2026-11-02）
+### 2026-11-02 Hermes 升级到 v0.22.5
 
-已在本地重建并验证，**生产未部署**。仓库里的 `hermes-stack.lock`、`patches/` 和插件 1.6.0 对应新版本，生产还跑在下面记录的旧基线和
-插件 1.5.0 上。去留清单、部署和回滚方案见 [`hermes-upgrade-0.22.5.md`](hermes-upgrade-0.22.5.md)。
+基线从 `f53b184c` 换到 `v0.22.5`（`bf0203a7`），补丁从 11 个减到 8 个，插件升到 1.6.0，Python 从 3.11 换到 3.14.7。新版本放在并排目录，旧目录没动。
+补丁去留、发现的问题和回滚步骤见 [`hermes-upgrade-0.22.5.md`](hermes-upgrade-0.22.5.md)。由 Fable subagent 只读审查，修复后复核通过。
 
-本地发现一个**生产现有漏洞**：文本命令 `@Bot /restart` 不经过 Slash 闸门，任何成员都可能运行管理命令。修复在新补丁里，部署前仍然存在。
+修掉一个**已在生产存在的漏洞**：文本命令 `@Bot /restart` 不经过 Slash 闸门，任何成员都能运行管理命令。现在文本命令和原生命令用同一个判断，
+被拒的命令退回普通聊天。
+
+部署时才暴露的两个问题，都已处理：
+
+- 上游默认的 Browser Use 后端在有 `uvx` 时生效，生产 PATH 里正好有，受限浏览器回退会被悄悄禁用。配置加了 `browser.backend: "off"`，校验脚本强制。
+- 生产 uv 0.11.2 只能装 Python 3.14.3，其 SQLite 3.50.4 有 WAL 重置损坏 bug，而旧环境是已修复的 3.53.1。用 uv 0.12.17（只放在临时目录，生产的 uv 没换）
+  装 3.14.7，SQLite 为 3.53.1，第二次重启后警告消失。
+
+配置只新增键，原有值和注释都保留：
+
+```yaml
+browser:
+  backend: "off"
+web:
+  keyless_fallback: false
+  keyless_rescue: false
+hooks:
+  output_spill:
+    enabled: false
+tools:
+  tool_search:
+    enabled: "off"
+  connectors:
+    enabled: false
+security:
+  allow_lazy_installs: false
+```
+
+`/usr/local/bin/hermes` 还指向旧版本，确认稳定后改到新环境。
+
+验证结果：
+
+- 重启前（生产机，独立进程）：定向测试通过，用的是发布包里的测试和新虚拟环境。`state.db` 副本从 schema 16 迁到 32，耗时 1.8 秒，`quick_check` 为 ok。
+- 真实请求：主模型 `MAIN_OK`（x-api-key，3.7 秒）；故意无效的 Anthropic Key 切到小米，返回 `FALLBACK_OK`；纯红 PNG 识别为 Red；`chatbird_run_code` 生成 CSV，
+  `extract_media` 能识别，通过严格校验，约 2 美分。
+- 网页：DDGS 搜索、`example.com`、帮助中心文章 API（2,746 字符）、Vicious Syndicate Reader（15,197 字符）、本地 Chromium 回退（19,570 字符，进程已清理）。
+- 重启后：服务 `active`，`NRestarts=0`，Discord 已连接，无 ERROR。会话 29 个、消息 756 条，和备份一致。`gaming-references` 审批仍有效。Discord 全局命令 72 个，5 个公开命令都在。
+- 严格发送（走同一启动代码的独立进程，真实路径）：两个环境变量启动和重载 `.env` 后都是 `1` 和 `0`；`sessions.json`、`state.db`、`SOUL.md`、`.env`、`config.yaml`、`auth.json`、
+  Guild 记忆、用户画像、私信日志都不可发送。`.env` 的 `HERMES_MEDIA_*` 行数为 0。
+- 两次切换的停机都约 2 秒，最终 PID `773455`（12:27:16 CET 启动）。RSS 约 230 MiB，旧版本约 135 MiB。
+
+未验证：
+
+- 未在 Discord 实际对话验收，清单见升级文档。
+- 真实额度耗尽时的错误文本。
+
+部署前备份（仅生产机，目录权限 `0700`）：
+`/root/.hermes/backups/hermes-0.22.5-20261102T112302Z/`，含 `state.db`（schema 16）、`.env`、`auth.json`、配置、插件 1.5.0、校验脚本、记忆、会话和 Skill。
+
+配置 SHA-256：
+
+- 部署前：`8187250350a19b402aba3e0c28b12f5c45700b707a8fa33d546581830fb02c82`
+- 部署后：`396df79fc994421bcaa7138683047205c3c2f82d2e618c3e62618b3eadb64a13`
 
 ### 2026-11-02 远程代码执行与文件发送收紧
 
@@ -80,7 +135,7 @@ Fable 审查结论是可以部署，并发现两处已修复的问题：代码�
 - API 返回的容器 `expires_at` 约为 1 小时后，文档写容器保留 30 天。隐私政策按更长的 30 天写。
 
 升级 Hermes 时要重新确认：SDK 0.87.0 用的是 `client.beta.files`，新版 SDK 中其结构有破坏性变化，应改用
-`client.files`。
+`client.files`。v0.22.5 仍锁定 0.87.0，契约测试会在版本变化时失败提醒。
 
 部署前备份（仅生产机，目录权限 `0700`）：
 `/root/.hermes/backups/code-execution-20261102T000711Z/`。
@@ -143,10 +198,7 @@ fallback_model:
 
 - sshd 仍允许 root 密码登录，由用户执行。服务仍以 root 运行，没有 systemd 沙箱。
 - 图片下载的 DNS 重绑定防护（上游 `42626da1ce`）改动面较大，留待升级 Hermes。
-- Hermes 升级：锁定基线为 v0.17.0（2026-06-27），最新稳定版 v0.22.5（2026-10-23）。把补丁栈与 2026-11-01
-  的上游 main 试合并，17 个文件冲突，包括 `gateway/session.py`、`gateway/run.py`、Discord 适配器和
-  `tools/memory_tool.py`。升级应单独安排，并以稳定 tag 为目标。main 已有原生 `scope_id` 会话隔离，可能替代
-  部分 Guild 隔离补丁；但 `session_search` 仍无 Guild 过滤，适配器也未识别 `sk-ant-usr`。
+- Hermes 升级：当时锁定基线为 v0.17.0，已在 2026-11-02 升到 v0.22.5，见上面一节。
 
 部署前备份（仅生产机，目录权限 `0700`）：
 `/root/.hermes/backups/security-history-fallback-20261101T222947Z/`。
@@ -459,16 +511,14 @@ Age-Restricted Channels 文章：3.9 秒返回 2,746 字符正文，没有启动
 的 Gateway 仍使用修改前的安全配置，因此共享 `USER.md` 从未生效。修复已恢复
 `false`、更正持久化的 `chatbird-admin` Skill、升级策略插件并安装上述启动守卫。
 
-Hermes 的 `/memory` 命令管理“写入审批队列”，不是查看已有记忆：
+Hermes 的 `/memory` 命令管理“写入审批队列”。这个队列是整个 profile 共用的，从一个 Guild 能看到并应用另一个 Guild 暂存的写入，
+所以 v0.22.5 起 `/memory` 在 Discord 上直接拒绝。`memory.write_approval` 必须保持关闭，启动校验会检查。
 
-- `memory.write_approval = off` 是当前默认值，表示已获策略允许的写入直接保存；它不表示关闭记忆。
-- `/memory approval on` 会把后续内置记忆写入放入待审批队列。
-- `/memory approve <id>`、`/memory approve all`、`/memory reject <id>` 和 `/memory reject all` 用于处理队列。
-- `No pending memory writes.` 只表示队列为空，不表示当前没有任何持久记忆。
+cron 任务用创建它的 Guild 的记忆。
 
 ## Slash Commands
 
-原生 Slash Commands 已开启并以 Discord 全局命令注册。当前共 55 个命令；全局命令首次同步后 Discord 客户端可能需要刷新或等待传播。
+原生 Slash Commands 已开启并以 Discord 全局命令注册。当前共 72 个命令；全局命令首次同步后 Discord 客户端可能需要刷新或等待传播。
 
 普通用户可使用：
 
@@ -478,7 +528,7 @@ Hermes 的 `/memory` 命令管理“写入审批队列”，不是查看已有�
 - `/version`
 - `/usage`
 
-其他所有内置、插件和未来动态发现的 Slash Command 默认管理员专属，必须同时通过管理员用户 ID 与当前 Guild 管理频道校验。DM 中所有 Slash Command 均拒绝；普通用户的 `/skill` 自动补全返回空列表，避免泄露已安装 Skill 目录。
+其他所有内置、插件和未来动态发现的 Slash Command 默认管理员专属，必须同时通过管理员用户 ID 与当前 Guild 管理频道校验。DM 中所有 Slash Command 均拒绝；普通用户的 `/skill` 自动补全返回空列表，避免泄露已安装 Skill 目录。文本形式的命令（`@Bot /restart`）走同一个判断，被拒时退回普通聊天。
 
 Discord 命令面板中的应用名称是“小鸟AI”。邀请应用需要 `bot` 和 `applications.commands` 范围。用户所在频道还应允许“使用应用命令”。
 
@@ -516,11 +566,8 @@ Hermes 核心提示词仍会说明底层框架是 Hermes Agent。为了防止模
 
 `hermes-stack.lock` 固定上游 Hermes 提交、补丁顺序和测试覆盖文件。对一个干净的 Hermes
 checkout，可用 `scripts/apply-hermes-patches.sh <checkout> --check` 先做无写入
-验证，再去掉 `--check` 应用完整 ChatBird 补丁栈。生产机当前保留 Hermes 自身的
-Git 工作树；该脚本用于重建和升级验证，不直接覆盖生产工作树。
-
-下表和“生产 Hermes 基线提交”记录的是生产当前运行的旧补丁栈。v0.22.5 的新补丁栈有 8 个补丁，去掉了
-`hermes-skill-policy-exception`、`hermes-anthropic-user-api-key` 和 `hermes-vision-redirect-ssrf`，部署后这里要同步改。
+验证，再去掉 `--check` 应用完整 ChatBird 补丁栈，然后用 `scripts/build-hermes-release.sh` 打包。
+生产按发布包并排部署，切换和回滚只改 systemd drop-in。
 
 | 文件 | 用途 |
 |---|---|
@@ -529,35 +576,18 @@ Git 工作树；该脚本用于重建和升级验证，不直接覆盖生产工�
 | [`../patches/hermes-chatbird-home-notice.patch`](../patches/hermes-chatbird-home-notice.patch) | 关闭 Discord home-channel onboarding 提示 |
 | [`../patches/hermes-chatbird-slash-policy.patch`](../patches/hermes-chatbird-slash-policy.patch) | Slash Command 公开集合与管理员频道双重校验 |
 | [`../patches/hermes-discord-category-channel-allowlist.patch`](../patches/hermes-discord-category-channel-allowlist.patch) | Guild 频道（含语音频道内置文字聊天）继承 Category 白名单，并在频道删除后取消遗留回合 |
-| [`../patches/hermes-skill-policy-exception.patch`](../patches/hermes-skill-policy-exception.patch) | 公共频道跳过不可用的 Skill 加载并直接使用网页工具 |
 | [`../patches/hermes-public-skills-web-extract.patch`](../patches/hermes-public-skills-web-extract.patch) | 公开 Skill 哈希审批、自我改进二次审批与无密钥静态网页提取 |
 | [`../patches/hermes-web-browser-fallback.patch`](../patches/hermes-web-browser-fallback.patch) | `web_search`/`web_extract` 内部受限浏览器回退，不扩大公开工具权限 |
-| [`../patches/hermes-anthropic-user-api-key.patch`](../patches/hermes-anthropic-user-api-key.patch) | `sk-ant-usr-*` Anthropic API Key 走 `x-api-key`，不套用 Claude Code OAuth 身份转换 |
 | [`../patches/hermes-help-center-article-api.patch`](../patches/hermes-help-center-article-api.patch) | 白名单 Zendesk 帮助中心文章在浏览器回退前改读公开文章 API |
-| [`../patches/hermes-vision-redirect-ssrf.patch`](../patches/hermes-vision-redirect-ssrf.patch) | 回补上游修复，让图片下载的重定向防护真正生效 |
 | [`../patches/hermes-gateway-browser.conf`](../patches/hermes-gateway-browser.conf) | Hermes 服务的本地 Chromium 可执行文件位置 |
 | [`../plugins/chatbird-policy/`](../plugins/chatbird-policy/) | 请求级工具权限、管理员上下文与分层记忆 |
 | [`../patches/hermes-tests/test_discord_chatbird_access.py`](../patches/hermes-tests/test_discord_chatbird_access.py) | 生产 Hermes Discord 定向回归测试 |
 | [`../patches/hermes-tests/test_chatbird_skill_policy_exception.py`](../patches/hermes-tests/test_chatbird_skill_policy_exception.py) | 公共频道 Skill 例外回归测试 |
+| [`../patches/hermes-tests/test_chatbird_upgrade_contract.py`](../patches/hermes-tests/test_chatbird_upgrade_contract.py) | 插件和生产依赖的 Hermes 行为，升级后先跑它 |
+| [`../patches/hermes-tests/test_chatbird_provider_e2e.py`](../patches/hermes-tests/test_chatbird_provider_e2e.py) | 真实 SDK 对本地服务器：Key 类型、备用模型、代码执行文件 |
 | [`../tests/test_chatbird_policy.py`](../tests/test_chatbird_policy.py) | 本地策略插件测试 |
 
-生产 Hermes 基线提交：
-
-| 提交 | 说明 |
-|---|---|
-| `49d2aa56` | Guild 会话与记忆隔离 |
-| `0b111a56` | Guild 成员开放与 DM 日志 |
-| `bb0c3fff` | 关闭全局 home onboarding 提示 |
-| `dc1aa78f` | Slash Command 分级与管理员频道校验 |
-
-生产工作树还应用了两项由本仓库补丁栈跟踪的差异：
-
-- `hermes-discord-category-channel-allowlist.patch`
-- `hermes-skill-policy-exception.patch`
-
-2026-10-11 起，生产工作树另外应用 `hermes-anthropic-user-api-key.patch` 和
-`hermes-help-center-article-api.patch`。2026-11-01 起另外应用
-`hermes-vision-redirect-ssrf.patch`。
+生产 Hermes 基线是 `v0.22.5`（`bf0203a7`），应用 `hermes-stack.lock` 列出的 8 个补丁。
 
 这些差异、生产配置、策略插件和测试均以 ChatBird 仓库 `main` 为唯一长期来源；
 `codex/track-hermes-stack` 只是已合并的历史开发分支，不再承载独有内容。
@@ -606,15 +636,15 @@ systemctl is-active hermes-gateway.service
 fail2ban-client status sshd
 systemctl show hermes-gateway.service -p MainPID -p NRestarts -p MemoryCurrent
 journalctl -u hermes-gateway.service --since "10 minutes ago" --no-pager -n 100
-git -C /usr/local/lib/hermes-agent status --short
-git -C /usr/local/lib/hermes-agent log -5 --oneline
+cat /usr/local/lib/hermes-agent-0.22.5/CHATBIRD_RELEASE
+cat /etc/systemd/system/hermes-gateway.service.d/release.conf
 ```
 
 部署或升级时：
 
 1. 先在本地审阅和测试补丁。
 2. 检查生产内存、磁盘和服务负载。
-3. 只上传需要变化的文件并保留临时备份。
+3. 新版本放到并排目录并保留备份，切换只改 systemd drop-in。
 4. 在生产只运行相关的单个测试文件。
 5. 配置和源码都就绪后只重启网关一次。
 6. 检查服务状态、重启次数、短日志和 Discord API 状态。

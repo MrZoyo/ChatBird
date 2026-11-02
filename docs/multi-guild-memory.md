@@ -54,9 +54,11 @@ The test guild currently accepts ChatBird interactions in `常规`
 
 ## Deployment Record
 
-The production Hermes tree is `/usr/local/lib/hermes-agent`. Commit
-`49d2aa56` (`fix(discord): isolate guild sessions and memory`) contains the
-session, memory, slash-command, and guild allowlist changes. Before deployment,
+The original deployment used the production Hermes tree at
+`/usr/local/lib/hermes-agent`. Commit `49d2aa56`
+(`fix(discord): isolate guild sessions and memory`) contained the session,
+memory, slash-command, and guild allowlist changes. Since 2026-11-02 production
+runs `/usr/local/lib/hermes-agent-0.22.5` with the rebuilt patch. Before deployment,
 `/root/.hermes/config.yaml` was backed up to
 `/root/.hermes/config.yaml.before-guild-isolation`.
 

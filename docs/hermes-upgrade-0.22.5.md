@@ -1,13 +1,13 @@
 # Hermes 升级到 v0.22.5
 
-状态：本地重建和验证已完成，生产尚未部署。生产仍是旧基线 `f53b184c` 加旧补丁栈，生产事实以
-[`production-state.md`](production-state.md) 为准。
+状态：2026-11-02 已部署到生产，等 Discord 实际对话验收。部署记录和验证结果在
+[`production-state.md`](production-state.md)，这里是去留清单和方案。
 
 | 项目 | 旧 | 新 |
 |---|---|---|
 | 基线 | `f53b184c`（2026-06-27，文档里称 v0.17.0） | `v0.22.5` = `bf0203a7`（2026-10-22） |
 | 补丁 | 11 个 | 8 个 |
-| Python | 3.11 | 3.14（见“解释器”） |
+| Python | 3.11 | 3.14.7（见“解释器”） |
 | 策略插件 | 1.5.0 | 1.6.0 |
 | Anthropic SDK | 0.87.0 | 0.87.0（v0.22.5 仍锁这个版本） |
 | 状态库 schema | 16 | 32（首次打开时自动迁移） |
@@ -39,17 +39,7 @@ ChatBird 的闸门只拦原生 Slash。生产的 `gateway/run.py` 确认有 `_ch
 `group_allow_admin_from`，所以这道检查是关闭的。按代码路径，任何成员都能这样运行 `/restart`、`/model`、`/new`，也能通过技能
 命令加载未公开的 Skill。新补丁让文本命令和原生命令用同一个判断，被拒的命令退回普通聊天，不执行任何东西。
 
-这个漏洞在升级部署之前一直存在。如果不想等升级，可以先在生产配置里加：
-
-```yaml
-platforms:
-  discord:
-    extra:
-      group_allow_admin_from: ["<管理员 ID>"]
-      group_user_allowed_commands: [status, version, usage]
-```
-
-这只挡内置命令，不挡技能命令，也不检查管理员是否在管理频道，所以只算临时措施。上面的配置片段没有在旧版本上实测过。
+这个漏洞在部署之前一直存在。
 
 **升级才会出现、已修复的回归：**
 
@@ -65,6 +55,7 @@ platforms:
 |---|---|---|---|
 | `tools.tool_search.enabled` | `auto` | `"off"` | 插件工具藏到 `tool_search` 后面，闸门不放行这个名字，`chatbird_*` 在公开频道全部不可用 |
 | `web.keyless_fallback`、`web.keyless_rescue` | 开 | 关 | 搜索或提取失败时，查询和 URL 发给 Exa、Parallel、Firecrawl、Keenable 的匿名接口，还会抓取 robots 只允许索引的站点 |
+| `browser.backend` | 空（有 `uvx` 就用 Browser Use CLI） | `"off"` | 生产 PATH 有 `uvx`，`check_browser_requirements` 变假，受限浏览器回退被悄悄禁用。这是在生产上做重启前烟测时发现的 |
 | `security.allow_lazy_installs` | 开 | 关 | 公开请求可能触发运行时安装软件包 |
 | `tools.connectors.enabled` | 开 | 关 | 暴露 Nous 连接器网关 |
 | `hooks.output_spill.enabled` | 开，阈值 1 万字符 | 关 | 管理员回合的策略提示超过阈值时被换成文件引用 |
@@ -122,17 +113,19 @@ Fable subagent 做了只读审查，结论是修复后可部署：没有发现�
 - 真实网络：`web_extract` 经 `simple-http` 读到 `example.com`，`web_search` 经 DDGS 返回 Discord 帮助中心文章。
 - 网关用占位 token 启动：插件加载，工具解析出 23 个，含三个 `chatbird_*`，走到 Discord 登录后按 401 退出。
 
-**没有验证：** Discord 真实对话；真实 Anthropic 和小米请求；真实额度耗尽时的错误文本；Linux 上的本地 Chromium；生产机上的实际内存。
-本地启动峰值 RSS 约 261 MiB（macOS），生产当前运行中约 135 MiB。
+以上是部署前的本地结果。生产上的真实请求、本地 Chromium 和内存都在部署时验证过，结果在 `production-state.md`。还没验证的是 Discord 真实对话和真实额度耗尽时的错误文本。
 
 ## 解释器
 
-v0.22.5 的 `pyproject.toml` 只给 `python_version >= '3.14'` 固定依赖版本，较旧的 Python 只为旧安装完成自更新而保留。生产现在是 3.11，
+v0.22.5 的 `pyproject.toml` 只给 `python_version >= '3.14'` 固定依赖版本，较旧的 Python 只为旧安装完成自更新而保留。生产原来是 3.11，
 所以要新建 3.14 环境。这是原地 `git pull` 不可行的主要原因，也是采用并排部署的原因。
+
+3.14 的具体版本也有要求：SQLite 要 3.51.3 以上，否则 Hermes 启动时警告 WAL 重置损坏 bug。uv 管理的 Python 3.14.3 带 3.50.4，3.14.7 带 3.53.1。
+生产的 uv 0.11.2 不认识 3.14.7，所以用一份临时下载的 uv 0.12.17 安装。
 
 ## 部署方案
 
-原则：新版本放到新目录，旧目录完全不动，切换和回滚都只是改 systemd drop-in。不在生产机构建，只下载 wheel。
+原则：新版本放到新目录，旧目录完全不动，切换和回滚都只是改 systemd drop-in。不在生产机构建，只下载 wheel。下面是实际执行的步骤。
 
 ### 本地准备
 
@@ -162,22 +155,26 @@ grep -c -E '^CHATBIRD_ADMIN_(USERS|CHANNELS)=' /root/.hermes/.env   # 必须是 
 R=/usr/local/lib/hermes-agent-0.22.5
 mkdir -p "$R" && tar -xzf /tmp/hermes-0.22.5.tar.gz -C "$R"
 cd "$R"
-/root/.local/bin/uv python install 3.14
-UV_PROJECT_ENVIRONMENT="$R/venv" nice -n 10 /root/.local/bin/uv sync --locked --python 3.14 --no-dev \
+V="$R/venv-3.14.7"
+curl -sSL -o /tmp/uv.tgz https://github.com/astral-sh/uv/releases/download/0.12.17/uv-x86_64-unknown-linux-gnu.tar.gz
+tar -xzf /tmp/uv.tgz -C /tmp
+U=/tmp/uv-x86_64-unknown-linux-gnu/uv
+"$U" python install 3.14.7 --no-bin
+UV_PROJECT_ENVIRONMENT="$V" nice -n 10 "$U" sync --locked --python 3.14.7 --no-dev \
   --extra discord --extra anthropic --extra ddgs
-/root/.local/bin/uv pip install --python "$R/venv" pytest==9.1.1 pytest-asyncio==1.3.0
-"$R/venv/bin/python" -c 'import anthropic, discord, ddgs; print(anthropic.__version__, discord.__version__)'
+"$U" pip install --python "$V" pytest==9.1.1 pytest-asyncio==1.3.0
+"$V/bin/python" -c 'import sqlite3, anthropic, discord, ddgs; print(sqlite3.sqlite_version, anthropic.__version__, discord.__version__)'
 ```
 
 `uv sync` 只下载 wheel。如果它开始编译，停下。
 
 ### 重启前验证（独立进程，不碰线上数据）
 
-先把仓库里的 1.6.0 插件放到临时目录，并设好 `CHATBIRD_PLUGIN_DIR`：
+先把仓库里的 1.6.0 插件放到临时目录，并设好 `CHATBIRD_PLUGIN_DIR`。把配置镜像放在插件目录上两级的 `patches/` 下，配置契约测试才不会跳过：
 
 ```bash
 cd "$R"
-PATH="$R/venv/bin:$PATH" CHATBIRD_PLUGIN_DIR=/tmp/chatbird-policy-1.6.0 nice -n 10 python -m pytest -q \
+PATH="$V/bin:$PATH" CHATBIRD_PLUGIN_DIR=/tmp/chatbird-policy-1.6.0 nice -n 10 python -m pytest -q \
   tests/gateway/test_chatbird_upgrade_contract.py tests/plugins/test_discord_chatbird_access.py
 ```
 
@@ -185,9 +182,9 @@ PATH="$R/venv/bin:$PATH" CHATBIRD_PLUGIN_DIR=/tmp/chatbird-policy-1.6.0 nice -n 
 
 ```bash
 T=$(mktemp -d)
-cp -p /root/.hermes/state.db "$T/state.db"
-cd "$R" && HERMES_HOME="$T" "$R/venv/bin/python" -c 'from hermes_state import SessionDB; SessionDB(); print("ok")'
-python3 -c "import sqlite3,sys; c=sqlite3.connect('$T/state.db'); print(c.execute('PRAGMA quick_check').fetchone(), c.execute('select count(*) from messages').fetchone())"
+python3 -c "import sqlite3; sqlite3.connect('file:/root/.hermes/state.db?mode=ro', uri=True).backup(sqlite3.connect('$T/state.db'))"
+cd "$R" && HERMES_HOME="$T" "$V/bin/python" -c 'from hermes_state import SessionDB; SessionDB(); print("ok")'
+python3 -c "import sqlite3; c=sqlite3.connect('$T/state.db'); print(c.execute('PRAGMA quick_check').fetchone(), c.execute('select count(*) from messages').fetchone())"
 rm -rf "$T"
 ```
 
@@ -197,7 +194,7 @@ rm -rf "$T"
 ```bash
 T=$(mktemp -d)
 ( cd "$R" && HERMES_HOME="$T" _HERMES_GATEWAY=1 HERMES_MEDIA_DELIVERY_STRICT=1 HERMES_MEDIA_TRUST_RECENT_FILES=0 \
-  "$R/venv/bin/python" - <<'PY'
+  "$V/bin/python" - <<'PY'
 import importlib.util, json, os
 from dotenv import dotenv_values
 os.environ["ANTHROPIC_API_KEY"] = dotenv_values("/root/.hermes/.env")["ANTHROPIC_API_KEY"]
@@ -215,6 +212,9 @@ rm -rf "$T"
 
 要看到 `success` 为真，至少一个文件，`deliverable` 全为真。这一步花约 2 美分。
 
+同样在临时 `HERMES_HOME` 里，还要验证：主模型回复；用无效 Anthropic Key 切到小米；图片分析；`web_search`；`web_extract` 读静态页、帮助中心和 Vicious Syndicate；
+本地 Chromium 回退能读到正文且进程被清理。`browser_backend_ready()` 必须为真，否则先查 `browser.backend`。
+
 ### 切换（中断时间应在 30 秒内）
 
 ```bash
@@ -231,7 +231,8 @@ cp -a /root/.hermes/state.db* /root/.hermes/config.yaml /root/.hermes/.env /root
 
 1. 把 `/root/.hermes/plugins/chatbird-policy/` 换成 1.6.0。
 2. 把 `validate-production-config.py` 换到 `/root/.hermes/chatbird/`。
-3. 把 `display`、`hooks`、`tools`、`security`、`web.keyless_*` 这几项合并进 `/root/.hermes/config.yaml`（改前改后都记 SHA-256）。
+3. 把 `browser.backend`、`hooks`、`tools`、`security`、`web.keyless_*` 这几项合并进 `/root/.hermes/config.yaml`（改前改后都记 SHA-256）。
+   不要用配置镜像覆盖：部署时生产的 `allowed_channels` 比镜像多 3 个频道，现在镜像已同步，但以后也要先比对。
    旧 Hermes 会忽略这些键，新校验要求有它们。
 4. 跑一次校验：`/usr/bin/python3 /root/.hermes/chatbird/validate-production-config.py /root/.hermes/config.yaml`。
 5. 写 drop-in `/etc/systemd/system/hermes-gateway.service.d/release.conf`：
@@ -239,9 +240,9 @@ cp -a /root/.hermes/state.db* /root/.hermes/config.yaml /root/.hermes/.env /root
 ```ini
 [Service]
 ExecStart=
-ExecStart=/usr/local/lib/hermes-agent-0.22.5/venv/bin/python -m hermes_cli.main gateway run
-Environment="PATH=/usr/local/lib/hermes-agent-0.22.5/venv/bin:/root/.hermes/node/bin:/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-Environment="VIRTUAL_ENV=/usr/local/lib/hermes-agent-0.22.5/venv"
+ExecStart=/usr/local/lib/hermes-agent-0.22.5/venv-3.14.7/bin/python -m hermes_cli.main gateway run
+Environment="PATH=/usr/local/lib/hermes-agent-0.22.5/venv-3.14.7/bin:/root/.hermes/node/bin:/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="VIRTUAL_ENV=/usr/local/lib/hermes-agent-0.22.5/venv-3.14.7"
 ```
 
 ```bash
@@ -249,7 +250,7 @@ systemctl daemon-reload
 systemctl start hermes-gateway.service
 ```
 
-`/usr/local/bin/hermes` 这个软链接在确认运行稳定后再改到新目录，改之前管理命令还是旧版本。
+`/usr/local/bin/hermes` 这个软链接在确认运行稳定后再改到 `venv-3.14.7/bin/hermes`，改之前管理命令还是旧版本。
 
 ### 重启后检查
 
@@ -260,9 +261,8 @@ journalctl -u hermes-gateway.service --since "5 minutes ago" --no-pager -n 100
 free -m
 ```
 
-要确认：Discord 已连接，`NRestarts=0`，日志没有 `chatbird-policy` 加载错误，`MemoryCurrent` 低于 800 MiB，公开审批 Skill 仍可见
-（`gaming-references`），全局 Slash 命令里 `/help`、`/whoami`、`/status`、`/version`、`/usage` 还在，
-`agent-browser` 0.26.0 的 requirements、公开网页导航、DOM 读取和进程清理四项烟测通过。
+要确认：Discord 已连接，`NRestarts=0`，日志没有 `chatbird-policy` 加载错误，也没有 `linked SQLite` 警告，`MemoryCurrent` 低于 800 MiB，公开审批 Skill 仍可见
+（`gaming-references`），全局 Slash 命令里 `/help`、`/whoami`、`/status`、`/version`、`/usage` 还在。
 
 Discord 验收（需要你在频道里操作）：
 

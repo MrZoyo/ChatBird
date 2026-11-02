@@ -86,6 +86,12 @@ def validate_config(data: dict[str, Any]) -> None:
             "the bridge hides chatbird_* tools from public turns"
         )
 
+    if _mapping(data, "browser").get("backend") not in ("off", False):
+        raise ConfigError(
+            "browser.backend must be off; "
+            "the Browser Use default silently disables the restricted browser fallback"
+        )
+
     if _mapping(data, "security").get("allow_lazy_installs") is not False:
         raise ConfigError(
             "security.allow_lazy_installs must be false; a public bot must not install packages at runtime"

@@ -78,6 +78,9 @@ web:
       - support.discord.com
 
 browser:
+  # "off" keeps the agent-browser driver the restricted fallback and admin tools use.
+  # Hermes otherwise defaults to the Browser Use CLI and hides the browser_* tools.
+  backend: "off"
   cloud_provider: local
   engine: chrome
 
@@ -93,6 +96,9 @@ discord:
     - "921407984586866781"
     - "1154706638901612625" # Bird Gaming administrator channel
     - "1220876330913234944" # 秘密研究 administrator channel
+    - "1146803504166473728"
+    - "1353823382390440066"
+    - "1163868678597656647"
   history_backfill: true
   history_backfill_limit: 200
   allowed_guilds:

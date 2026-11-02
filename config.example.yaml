@@ -60,6 +60,8 @@ web:
 # Local Chromium renders JavaScript but does not guarantee passage through
 # CAPTCHA, residential-IP, or advanced anti-bot challenges.
 browser:
+  # "off" keeps the agent-browser driver; Hermes otherwise defaults to the Browser Use CLI.
+  backend: "off"
   cloud_provider: local
   engine: chrome
 

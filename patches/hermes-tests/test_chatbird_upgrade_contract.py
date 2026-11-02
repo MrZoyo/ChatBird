@@ -231,6 +231,7 @@ def test_production_config_reaches_the_discord_gates(tmp_path):
         from gateway.display_config import resolve_tool_progress
         from hermes_cli.config import load_config
         from plugins.platforms.discord.adapter import DiscordAdapter
+        from tools import browser_tool
         from tools.hook_output_spill import get_spill_config
         from tools.web_tools_rescue import _keyless_rescue_enabled
         from tools.tool_search import ToolSearchConfig
@@ -253,6 +254,7 @@ def test_production_config_reaches_the_discord_gates(tmp_path):
             "tool_search": ToolSearchConfig.from_raw((user.get("tools") or {}).get("tool_search")).enabled,
             "fallback": user.get("fallback_model"),
             "lazy": (user.get("security") or {}).get("allow_lazy_installs"),
+            "browser_cli": browser_tool._is_browser_use_cli_mode(),
         }))
         """,
         DISCORD_BOT_TOKEN="fake",
@@ -270,6 +272,8 @@ def test_production_config_reaches_the_discord_gates(tmp_path):
     assert result["tool_search"] == "off"
     assert result["fallback"] == {"provider": "xiaomi", "model": "mimo-v2.6-flash"}
     assert result["lazy"] is False
+    # The Browser Use default turns off the agent-browser path the restricted fallback needs.
+    assert result["browser_cli"] is False
 
 
 # ── Process marker and file delivery ─────────────────────────────────
