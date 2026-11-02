@@ -120,7 +120,9 @@ systemctl daemon-reload
 ```
 
 守卫会在每次启动前恢复错误开启的共享画像开关，并拒绝缺少 Guild 白名单、使用
-通配符白名单或未启用 `chatbird-policy` 的配置。
+通配符白名单或未启用 `chatbird-policy` 的配置。它也要求 `config.example.yaml` 里的
+文件发送严格模式、匿名网页回退关闭等安全设置保持不变，并检查 `.env` 含有管理员映射、
+不含 `HERMES_MEDIA_*`。
 
 示例中的 ID 和凭据均为占位内容。真实密钥只应保存在部署环境中，不得提交到 Git。
 

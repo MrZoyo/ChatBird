@@ -26,10 +26,37 @@ gateway:
 # every Guild in a separate session and memory namespace.
 group_sessions_per_user: false
 
+# Tool progress cards would show internal tool calls in a public channel.
+display:
+  tool_progress: false
+
+# The policy plugin bounds its own prompt. Spilling it to a file past 10,000 characters
+# would replace the access policy with a preview and a read_file hint.
+hooks:
+  output_spill:
+    enabled: false
+
+# Hermes hides plugin tools behind a tool_search bridge by default. The policy gate
+# allows only named tools, so the bridge would hide chatbird_* from public turns.
+# Runtime package installs and the Nous connector gateway stay off on a public bot.
+tools:
+  tool_search:
+    enabled: "off"
+  connectors:
+    enabled: false
+
+security:
+  allow_lazy_installs: false
+
 web:
   # Both are no-key and request-driven; the extractor has no resident service.
   search_backend: ddgs
   extract_backend: simple-http
+  # A failed search or extract must not fall through to the anonymous Exa, Parallel,
+  # Firecrawl and Keenable tiers: that sends user queries and URLs to third parties and
+  # would fetch sites whose robots rules only allow index use.
+  keyless_fallback: false
+  keyless_rescue: false
   # Local Chromium starts only after the primary provider fails. Public users
   # still receive only web_search/web_extract, never browser_*.
   browser_fallback:

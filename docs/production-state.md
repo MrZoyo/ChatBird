@@ -22,6 +22,13 @@
 
 本地非敏感配置镜像是 [`../patches/chatbird-production-config.yaml`](../patches/chatbird-production-config.yaml)，环境变量格式参考 [`../.env.example`](../.env.example)。
 
+### 待部署：Hermes v0.22.5（2026-11-02）
+
+已在本地重建并验证，**生产未部署**。仓库里的 `hermes-stack.lock`、`patches/` 和插件 1.6.0 对应新版本，生产还跑在下面记录的旧基线和
+插件 1.5.0 上。去留清单、部署和回滚方案见 [`hermes-upgrade-0.22.5.md`](hermes-upgrade-0.22.5.md)。
+
+本地发现一个**生产现有漏洞**：文本命令 `@Bot /restart` 不经过 Slash 闸门，任何成员都可能运行管理命令。修复在新补丁里，部署前仍然存在。
+
 ### 2026-11-02 远程代码执行与文件发送收紧
 
 用户已在 Discord 确认频道历史和图片分析正常，这是 11 月 1 日部署的用户侧验收。下一步在 Hermes 升级和代码
@@ -511,6 +518,9 @@ Hermes 核心提示词仍会说明底层框架是 Hermes Agent。为了防止模
 checkout，可用 `scripts/apply-hermes-patches.sh <checkout> --check` 先做无写入
 验证，再去掉 `--check` 应用完整 ChatBird 补丁栈。生产机当前保留 Hermes 自身的
 Git 工作树；该脚本用于重建和升级验证，不直接覆盖生产工作树。
+
+下表和“生产 Hermes 基线提交”记录的是生产当前运行的旧补丁栈。v0.22.5 的新补丁栈有 8 个补丁，去掉了
+`hermes-skill-policy-exception`、`hermes-anthropic-user-api-key` 和 `hermes-vision-redirect-ssrf`，部署后这里要同步改。
 
 | 文件 | 用途 |
 |---|---|

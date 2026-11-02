@@ -1,133 +1,133 @@
 diff --git a/plugins/platforms/discord/adapter.py b/plugins/platforms/discord/adapter.py
+index da9b8cadbd..5c4b1a8e7b 100644
 --- a/plugins/platforms/discord/adapter.py
 +++ b/plugins/platforms/discord/adapter.py
-@@ -2897,7 +2897,9 @@
-     # parity with on_message.
+@@ -4268,7 +4268,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
+     ) -> bool:
+         """Mirror on_message's gates onto a slash invocation.
+         Returns False only *after* sending the ephemeral rejection, so the caller just stops."""
+-        allowed, reason = self._evaluate_slash_authorization(interaction)
++        allowed, reason = self._evaluate_slash_authorization(interaction, command_text)
+         if allowed:
+             return True
+         return await self._reject_slash(interaction, command_text, reason=reason or "unauthorized")
+@@ -4768,7 +4768,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
+                 """Filter skills by typed prefix against name and description (Discord caps at 25).
+                 Unauthorized users get ``[]``: no catalog leak, no per-keystroke ephemeral rejections."""
+                 try:
+-                    allowed, _reason = self._evaluate_slash_authorization(interaction)
++                    allowed, _reason = self._evaluate_slash_authorization(interaction, "/skill")
+                 except Exception:
+                     # Never raise from autocomplete; fail closed.
+                     return []
+@@ -6377,6 +6377,14 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
+             timestamp=message.created_at, auto_skill=_skills, channel_prompt=_channel_prompt,
+             channel_context=_channel_context,
+         )
++        # "@bot /restart" reaches the same command dispatch as a native slash command, so it passes the
++        # same gate. A denied one stays plain chat: tools are still gated per call and nothing runs.
++        if event.is_command() and not self._evaluate_chatbird_command_policy(
++            event.text, user_id=str(message.author.id), guild_id=str(guild.id) if guild else None,
++            channel_id=str(message.channel.id), channel=message.channel,
++        )[0]:
++            event.allow_gateway_control = False
++            event.message_type = MessageType.TEXT
+         if (
+             getattr(getattr(message, "author", None), "bot", False)
+             and self._is_bot_tag_debounce_continuation(message)
+@@ -6387,7 +6395,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
+         if thread_id:
+             await self._threads.mark_async(thread_id)
+         # Only live plain text is batched: recovery candidates are complete; coalescing would replay IDs.
+-        if (not recovered and msg_type == MessageType.TEXT and self._text_batch_delay_seconds > 0):
++        if (not recovered and event.message_type == MessageType.TEXT and self._text_batch_delay_seconds > 0):
+             self._enqueue_text_event(event)
+         else:
+             await self.handle_message(event)
+diff --git a/plugins/platforms/discord/adapter_slash_auth.py b/plugins/platforms/discord/adapter_slash_auth.py
+index b1513e7f6c..0eb36c0a7d 100644
+--- a/plugins/platforms/discord/adapter_slash_auth.py
++++ b/plugins/platforms/discord/adapter_slash_auth.py
+@@ -1,6 +1,7 @@
+ """Slash-command authorization verdict for the Discord adapter: the on_message gates, side-effect free."""
+ from __future__ import annotations
+ 
++import os
+ from typing import Any, Callable, Optional, Tuple
+ 
+ try:
+@@ -9,9 +10,13 @@ except ImportError:  # the adapter does not start without discord.py
+     discord = None
+ 
+ 
++_CHATBIRD_PUBLIC_COMMANDS = frozenset({"help", "whoami", "status", "version", "usage"})
++
++
+ class DiscordSlashAuthMixin:
+     _get_parent_channel_id: Callable[[Any], Optional[str]]
+     _discord_channel_keys_from_channel: Callable[..., set]
++    _discord_allowed_guilds: Callable[[], set]
+     _discord_guild_denied: Callable[[Any], bool]
+     _get_allowed_channels: Callable[[], set]
+     _get_ignored_channels: Callable[[], set]
+@@ -22,7 +27,7 @@ class DiscordSlashAuthMixin:
+     # fail closed unless allow-all; DISCORD_ALLOWED_CHANNELS alone authorizes per validated channel.
  
      def _evaluate_slash_authorization(
--        self, interaction: "discord.Interaction",
-+        self,
-+        interaction: "discord.Interaction",
-+        command_text: str = "",
-     ) -> Tuple[bool, Optional[str]]:
-         """Evaluate slash authorization without producing any response.
- 
-@@ -2989,21 +2991,86 @@
-             # is the existing "no allowlist = everyone" backwards-compat.
-             if allowed_users or allowed_roles:
-                 return (False, "missing interaction.user with allowlist configured")
-+        else:
-+            user_id = str(user.id)
-+            # Pass guild + is_dm so role check is scoped to the originating
-+            # guild and cross-guild DM bypass (#12136) can't land via the
-+            # slash surface either.
-+            if not self._is_allowed_user(
-+                user_id,
-+                author=user,
-+                guild=interaction_guild,
-+                is_dm=in_dm,
-+            ):
-+                return (
-+                    False,
-+                    "user not in DISCORD_ALLOWED_USERS / DISCORD_ALLOWED_ROLES",
-+                )
+-        self, interaction: discord.Interaction,
++        self, interaction: discord.Interaction, command_text: str = "",
+     ) -> tuple[bool, Optional[str]]:
+         """Evaluate slash authorization without responding; returns ``(allowed, reason)``.
+         Shared with side-effect-free callers (``/skill`` autocomplete returns [] per keystroke).
+@@ -85,6 +90,51 @@ class DiscordSlashAuthMixin:
+             channel_ids=channel_keys if not in_dm else None,
+         ):
+             return (False, "user not in DISCORD_ALLOWED_USERS / DISCORD_ALLOWED_ROLES")
++        return self._evaluate_chatbird_command_policy(
++            command_text,
++            user_id=user_id,
++            guild_id=getattr(interaction, "guild_id", None) or getattr(interaction_guild, "id", None),
++            channel_id=getattr(interaction, "channel_id", None) or getattr(chan_obj, "id", None),
++            channel=chan_obj,
++        )
 +
-+        return self._evaluate_chatbird_slash_policy(interaction, command_text)
-+
-+    def _evaluate_chatbird_slash_policy(
-+        self,
-+        interaction: "discord.Interaction",
-+        command_text: str,
-+    ) -> Tuple[bool, Optional[str]]:
-+        """Apply ChatBird's public-command and admin-channel policy."""
++    def _evaluate_chatbird_command_policy(
++        self, command_text: str, *, user_id: Any, guild_id: Any, channel_id: Any, channel: Any,
++    ) -> tuple[bool, Optional[str]]:
++        """ChatBird's command gate, for native slash commands and for typed ones alike. A few
++        read-only commands are public inside a guild; everything else needs the administrator's user
++        ID in that guild's administrator channel (or a thread under it)."""
 +        admin_users_raw = os.getenv("CHATBIRD_ADMIN_USERS", "")
 +        admin_channels_raw = os.getenv("CHATBIRD_ADMIN_CHANNELS", "")
-+        if not admin_users_raw and not admin_channels_raw:
-             return (True, None)
- 
--        user_id = str(user.id)
--        # Pass guild + is_dm so role check is scoped to the originating
--        # guild and cross-guild DM bypass (#12136) can't land via the
--        # slash surface either.
--        if not self._is_allowed_user(
--            user_id,
--            author=user,
--            guild=interaction_guild,
--            is_dm=in_dm,
++        # A deployment with no ChatBird settings keeps Hermes's own command handling. discord.allowed_guilds
++        # marks a ChatBird deployment, where a lost admin setting must close the gate, not open it.
++        if not admin_users_raw and not admin_channels_raw and not self._discord_allowed_guilds():
++            return (True, None)
 +        command_parts = (command_text or "").strip().split(maxsplit=1)
 +        if not command_parts:
 +            return (False, "missing slash command text")
 +        command_name = command_parts[0].lstrip("/").lower()
 +        if not command_name:
 +            return (False, "missing slash command name")
-+
-+        guild = getattr(interaction, "guild", None)
-+        guild_id_raw = getattr(interaction, "guild_id", None) or getattr(
-+            guild, "id", None,
-+        )
-+        if guild_id_raw is None:
++        if guild_id is None:
 +            return (False, "ChatBird slash commands are disabled in DMs")
-+
-+        public_commands = {"help", "whoami", "status", "version", "usage"}
-+        if command_name in public_commands:
++        if command_name in _CHATBIRD_PUBLIC_COMMANDS:
 +            return (True, None)
-+
-+        user = getattr(interaction, "user", None)
-+        user_id_raw = getattr(user, "id", None)
-+        if user_id_raw is None:
++        if user_id is None:
 +            return (False, "missing administrator user id")
-+        admin_users = {
-+            value.strip() for value in admin_users_raw.split(",") if value.strip()
-+        }
-+        if str(user_id_raw) not in admin_users:
++        admin_users = {value.strip() for value in admin_users_raw.split(",") if value.strip()}
++        if str(user_id) not in admin_users:
 +            return (False, "slash command is restricted to ChatBird administrators")
-+
-+        channel = getattr(interaction, "channel", None)
-+        channel_id_raw = getattr(interaction, "channel_id", None) or getattr(
-+            channel, "id", None,
-+        )
-+        channel_ids = {str(channel_id_raw)} if channel_id_raw is not None else set()
++        channel_ids = {str(channel_id)} if channel_id is not None else set()
 +        if isinstance(channel, discord.Thread):
 +            parent_id = self._get_parent_channel_id(channel)
 +            if parent_id:
 +                channel_ids.add(str(parent_id))
 +        if not channel_ids:
 +            return (False, "missing administrator channel id")
-+
-+        guild_id = str(guild_id_raw)
-+        admin_channels = {
-+            value.strip() for value in admin_channels_raw.split(",") if value.strip()
-+        }
-+        if not any(
-+            f"{guild_id}:{channel_id}" in admin_channels
-+            for channel_id in channel_ids
-         ):
-             return (
-                 False,
--                "user not in DISCORD_ALLOWED_USERS / DISCORD_ALLOWED_ROLES",
-+                "slash command is restricted to this guild's administrator channel",
-             )
- 
++        admin_channels = {value.strip() for value in admin_channels_raw.split(",") if value.strip()}
++        if not any(f"{guild_id}:{candidate}" in admin_channels for candidate in channel_ids):
++            return (False, "slash command is restricted to this guild's administrator channel")
          return (True, None)
-@@ -3018,7 +3085,9 @@
-         alert — the caller must stop on False (the interaction has already
-         been responded to).
-         """
--        allowed, reason = self._evaluate_slash_authorization(interaction)
-+        allowed, reason = self._evaluate_slash_authorization(
-+            interaction, command_text,
-+        )
-         if allowed:
-             return True
-         return await self._reject_slash(
-@@ -3947,7 +4016,9 @@
-                 since process start shows up on the very next keystroke.
-                 """
-                 try:
--                    allowed, _reason = self._evaluate_slash_authorization(interaction)
-+                    allowed, _reason = self._evaluate_slash_authorization(
-+                        interaction, "/skill",
-+                    )
-                 except Exception:
-                     # Defensive: never raise from autocomplete. Fail
-                     # closed by returning an empty suggestion list.
+ 
+     def _slash_role_grant(self, interaction: discord.Interaction) -> bool:

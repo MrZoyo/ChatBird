@@ -128,7 +128,10 @@ systemctl daemon-reload
 
 Before every start, the guard restores an accidentally enabled shared profile
 setting and rejects configurations that omit the guild allowlist, use its
-wildcard, or disable `chatbird-policy`.
+wildcard, or disable `chatbird-policy`. It also requires the safety settings in
+`config.example.yaml` to stay as they are, such as strict file delivery and the
+anonymous web tiers being off, and checks that `.env` has the administrator mapping
+and no `HERMES_MEDIA_*` line.
 
 All IDs and credentials in the examples are placeholders. Keep real secrets in
 the deployment environment and never commit them.

@@ -1,93 +1,9 @@
---- a/tools/web_tools.py
-+++ b/tools/web_tools.py
-@@ -875,6 +875,23 @@
-             )
-             response_data = provider.search(query, limit)
- 
-+            # Optional restricted browser fallback.  This is an internal
-+            # implementation detail of web_search: callers never receive the
-+            # interactive browser toolset.  It runs only when the primary
-+            # provider failed or returned no hits, and only when an explicitly
-+            # configured browser backend passes its readiness check.
-+            try:
-+                from tools.web_browser_fallback import maybe_search_with_browser
-+
-+                response_data = maybe_search_with_browser(
-+                    response_data, query=query, limit=limit
-+                )
-+            except Exception as fallback_exc:
-+                logger.warning(
-+                    "Restricted browser search fallback failed closed: %s",
-+                    fallback_exc,
-+                )
-+
-         debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
-         result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
-         debug_call_data["final_response_size"] = len(result_json)
-@@ -893,6 +910,31 @@
-         return tool_error(error_msg)
- 
- 
-+def _sync_extract_with_browser_fallback(
-+    provider: Any,
-+    safe_urls: List[str],
-+    *,
-+    format: Optional[str],
-+) -> List[Dict[str, Any]]:
-+    """Run a synchronous provider and optional browser retry in one worker.
-+
-+    Keeping both blocking phases in the same ``asyncio.to_thread`` call avoids
-+    a second executor handoff and ensures the browser session lifecycle remains
-+    wholly outside the shared gateway event loop.
-+    """
-+    results = provider.extract(safe_urls, format=format)
-+    try:
-+        from tools.web_browser_fallback import maybe_extract_with_browser
-+
-+        return maybe_extract_with_browser(results, safe_urls)
-+    except Exception as fallback_exc:
-+        logger.warning(
-+            "Restricted browser extract fallback failed closed: %s",
-+            fallback_exc,
-+        )
-+        return results
-+
-+
- async def web_extract_tool(
-     urls: List[str],
-     format: str = None,
-@@ -1037,11 +1079,25 @@
-             import inspect
-             if inspect.iscoroutinefunction(provider.extract):
-                 results = await provider.extract(safe_urls, format=format)
-+                try:
-+                    from tools.web_browser_fallback import maybe_extract_with_browser
-+
-+                    results = await asyncio.to_thread(
-+                        maybe_extract_with_browser, results, safe_urls
-+                    )
-+                except Exception as fallback_exc:
-+                    logger.warning(
-+                        "Restricted browser extract fallback failed closed: %s",
-+                        fallback_exc,
-+                    )
-             else:
--                # Run sync extract() in a thread so we don't block the
--                # event loop on network I/O.
-+                # Run the sync provider and optional browser fallback in one
-+                # worker so neither phase blocks the gateway event loop.
-                 results = await asyncio.to_thread(
--                    provider.extract, safe_urls, format=format
-+                    _sync_extract_with_browser_fallback,
-+                    provider,
-+                    safe_urls,
-+                    format=format,
-                 )
- 
-         # Merge any SSRF-blocked results back in
+diff --git a/tools/web_browser_fallback.py b/tools/web_browser_fallback.py
+new file mode 100644
+index 0000000000..f8d72e63b4
 --- /dev/null
 +++ b/tools/web_browser_fallback.py
-@@ -0,0 +1,774 @@
+@@ -0,0 +1,775 @@
 +"""Restricted browser fallback for the public web search/extract tools.
 +
 +This module deliberately exposes no interactive browser surface.  It uses a
@@ -215,15 +131,16 @@
 +    """Return whether the configured fallback browser satisfies its boundary."""
 +    config = _fallback_config()
 +    try:
-+        from tools import browser_tool
++        from tools.browser_tool_cloud import _get_cloud_provider
++        from tools.browser_tool_install import check_browser_requirements
 +
 +        if _bool_config(config, "require_cloud", True):
 +            # A local/CDP browser inherits the production host's network reach
 +            # and datacenter IP.  Public web fallback defaults to a managed
 +            # cloud browser both for SSRF isolation and anti-bot effectiveness.
-+            if browser_tool._get_cloud_provider() is None:
++            if _get_cloud_provider() is None:
 +                return False
-+        return bool(browser_tool.check_browser_requirements())
++        return bool(check_browser_requirements())
 +    except Exception as exc:
 +        logger.debug("Browser fallback readiness check failed: %s", exc)
 +        return False
@@ -465,7 +382,7 @@
 +        return None, str(exc)
 +    finally:
 +        try:
-+            from tools.browser_tool import cleanup_browser
++            from tools.browser_tool_lifecycle import cleanup_browser
 +
 +            cleanup_browser(task_id)
 +        except Exception as exc:
@@ -862,3 +779,62 @@
 +        browser_error,
 +    )
 +    return primary
+diff --git a/tools/web_tools.py b/tools/web_tools.py
+index 191d94ebed..3293a3b16f 100644
+--- a/tools/web_tools.py
++++ b/tools/web_tools.py
+@@ -337,6 +337,14 @@ def web_search_tool(query: str, limit: int = 5) -> str:
+         else:
+             logger.info("Web search via %s: '%s' (limit: %d)", provider.name, query, limit)
+             response_data = _memoized_search(provider, query, limit)
++            # Optional restricted browser fallback, internal to web_search: callers never receive the
++            # interactive browser toolset. It runs only when the primary provider failed or returned no
++            # hits, and only when an explicitly configured browser backend passes its readiness check.
++            try:
++                from tools.web_browser_fallback import maybe_search_with_browser
++                response_data = maybe_search_with_browser(response_data, query=query, limit=limit)
++            except Exception as fallback_exc:
++                logger.warning("Restricted browser search fallback failed closed: %s", fallback_exc)
+ 
+         debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
+         result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
+diff --git a/tools/web_tools_extract.py b/tools/web_tools_extract.py
+index 10b0a0b297..aeecfe7a0e 100644
+--- a/tools/web_tools_extract.py
++++ b/tools/web_tools_extract.py
+@@ -146,6 +146,17 @@ def _extract_timeout_seconds() -> float:
+         return _DEFAULT_EXTRACT_TIMEOUT_S
+ 
+ 
++async def _with_browser_fallback(results: list[dict], fetch_urls: list[str]) -> list[dict]:
++    """Retry failed entries in the restricted browser, off the gateway's event loop. The fallback is
++    internal to web_extract: callers never receive the interactive browser toolset."""
++    try:
++        from tools.web_browser_fallback import maybe_extract_with_browser
++        return await asyncio.to_thread(maybe_extract_with_browser, results, fetch_urls)
++    except Exception as fallback_exc:
++        logger.warning("Restricted browser extract fallback failed closed: %s", fallback_exc)
++        return results
++
++
+ async def _dispatch_extract(provider, fetch_urls: list[str], format: Optional[str]) -> list[dict]:
+     """Call ``provider.extract`` (async or sync-in-thread), with one-shot keyless rescue.
+ 
+@@ -169,7 +180,8 @@ async def _dispatch_extract(provider, fetch_urls: list[str], format: Optional[st
+                        provider.name, timeout, len(fetch_urls))
+         failed = [_result_entry(u, f"Extract timed out after {timeout:.0f}s via {provider.name}")
+                   for u in fetch_urls]
+-        if not _rescue_eligible(provider):
++        failed = await _with_browser_fallback(failed, fetch_urls)
++        if not _rescue_eligible(provider) or not all(r.get("error") for r in failed):
+             return failed
+         return await asyncio.to_thread(_rescue_extract, provider.name, fetch_urls, failed)
+     except Exception as exc:
+@@ -177,6 +189,7 @@ async def _dispatch_extract(provider, fetch_urls: list[str], format: Optional[st
+             raise
+         failed = [_result_entry(u, str(exc)) for u in fetch_urls]
+         return await asyncio.to_thread(_rescue_extract, provider.name, fetch_urls, failed)
++    results = await _with_browser_fallback(results, fetch_urls)
+     if results and all(r.get("error") for r in results) and _rescue_eligible(provider):
+         return await asyncio.to_thread(_rescue_extract, provider.name, fetch_urls, results)
+ 

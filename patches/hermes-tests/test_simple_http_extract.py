@@ -82,34 +82,18 @@ def test_connection_rejects_dns_rebinding_to_private_address(monkeypatch):
         raise AssertionError("private DNS answer was accepted")
 
 
-def test_search_and_extract_registration_use_separate_capabilities(monkeypatch):
-    import agent.web_search_registry as providers
+def test_production_web_selection_resolves_both_tools(monkeypatch):
     import tools.web_tools as web_tools
+    from tools.web_tools_extract import _resolve_extract_provider
 
-    class _Provider:
-        def __init__(self, *, search=False, extract=False):
-            self._search = search
-            self._extract = extract
+    monkeypatch.setattr(
+        web_tools, "_load_web_config",
+        lambda: {"search_backend": "ddgs", "extract_backend": "simple-http"},
+    )
+    web_tools._ensure_web_plugins_loaded()
 
-        def supports_search(self):
-            return self._search
-
-        def supports_extract(self):
-            return self._extract
-
-        def is_available(self):
-            return True
-
-    configured = {
-        "ddgs": _Provider(search=True),
-        "simple-http": _Provider(extract=True),
-    }
-    monkeypatch.setattr(web_tools, "_ensure_web_plugins_loaded", lambda: None)
-    monkeypatch.setattr(web_tools, "_get_search_backend", lambda: "ddgs")
-    monkeypatch.setattr(web_tools, "_get_extract_backend", lambda: "simple-http")
-    monkeypatch.setattr(providers, "get_provider", configured.get)
-
-    assert web_tools.check_web_search_available() is True
-    assert web_tools.check_web_extract_available() is True
-    monkeypatch.setattr(web_tools, "_get_extract_backend", lambda: "ddgs")
-    assert web_tools.check_web_extract_available() is False
+    assert web_tools.check_web_api_key() is True
+    assert web_tools._get_search_backend() == "ddgs"
+    provider, error = _resolve_extract_provider(web_tools._get_extract_backend())
+    assert error is None
+    assert provider.name == "simple-http"

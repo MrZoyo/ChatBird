@@ -20,7 +20,8 @@ class _Parent:
 
 
 def test_independent_review_is_tool_free_and_accepts_exact_json(tmp_path, monkeypatch):
-    import agent.background_review as review
+    import agent.background_review as background
+    import tools.public_skill_review as review
 
     captured = {}
 
@@ -37,14 +38,14 @@ def test_independent_review_is_tool_free_and_accepts_exact_json(tmp_path, monkey
 
     monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeReviewer))
     monkeypatch.setattr(
-        review,
+        background,
         "_resolve_review_runtime",
         lambda _agent: {
             "provider": "openai", "model": "test-model", "api_mode": None,
             "base_url": "", "api_key": "",
         },
     )
-    decision = review._independent_public_skill_review(_Parent(), _skill(tmp_path), "safe")
+    decision = review.independent_public_skill_review(_Parent(), _skill(tmp_path), "safe")
     assert decision.approved is True
     assert captured["enabled_toolsets"] == []
     assert captured["disabled_toolsets"] == ["all"]
@@ -54,7 +55,8 @@ def test_independent_review_is_tool_free_and_accepts_exact_json(tmp_path, monkey
 
 
 def test_independent_review_rejects_malformed_error_and_timeout(tmp_path, monkeypatch):
-    import agent.background_review as review
+    import agent.background_review as background
+    import tools.public_skill_review as review
 
     class MalformedReviewer:
         def __init__(self, **_kwargs):
@@ -68,14 +70,14 @@ def test_independent_review_rejects_malformed_error_and_timeout(tmp_path, monkey
 
     monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=MalformedReviewer))
     monkeypatch.setattr(
-        review,
+        background,
         "_resolve_review_runtime",
         lambda _agent: {
             "provider": "openai", "model": "test-model", "api_mode": None,
             "base_url": "", "api_key": "",
         },
     )
-    malformed = review._independent_public_skill_review(
+    malformed = review.independent_public_skill_review(
         _Parent(), _skill(tmp_path), "safe"
     )
     assert malformed.approved is False
@@ -86,7 +88,7 @@ def test_independent_review_rejects_malformed_error_and_timeout(tmp_path, monkey
             raise RuntimeError("review unavailable")
 
     monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=ErrorReviewer))
-    failed = review._independent_public_skill_review(_Parent(), _skill(tmp_path), "safe")
+    failed = review.independent_public_skill_review(_Parent(), _skill(tmp_path), "safe")
     assert failed.approved is False
     assert "failed" in failed.reason
 
@@ -104,37 +106,66 @@ def test_independent_review_rejects_malformed_error_and_timeout(tmp_path, monkey
             return True
 
     monkeypatch.setattr(review.threading, "Thread", NeverFinishes)
-    timed_out = review._independent_public_skill_review(_Parent(), _skill(tmp_path), "safe")
+    timed_out = review.independent_public_skill_review(_Parent(), _skill(tmp_path), "safe")
     assert timed_out.approved is False
     assert "timed out" in timed_out.reason
 
 
-def test_background_target_rebinds_captured_discord_identity(monkeypatch):
-    import agent.background_review as review
-    from gateway.session_context import get_session_env
+def test_review_thread_keeps_the_discord_identity_after_the_turn_ends():
+    """run_agent starts the fork through propagate_context_to_thread; the gate needs this identity."""
+    import threading
 
-    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
-    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "222")
-    monkeypatch.setenv("HERMES_SESSION_USER_ID", "333")
-    monkeypatch.setenv("HERMES_SESSION_KEY", "agent:main:discord:guild-111")
+    from gateway.session_context import clear_session_vars, get_session_env, set_session_vars
+    from tools.thread_context import propagate_context_to_thread
+
     captured = {}
 
-    def run(*_args):
-        captured["platform"] = get_session_env("HERMES_SESSION_PLATFORM")
-        captured["chat_id"] = get_session_env("HERMES_SESSION_CHAT_ID")
-        captured["user_id"] = get_session_env("HERMES_SESSION_USER_ID")
-        captured["session_key"] = get_session_env("HERMES_SESSION_KEY")
+    def read_identity():
+        captured.update(
+            platform=get_session_env("HERMES_SESSION_PLATFORM"),
+            chat_id=get_session_env("HERMES_SESSION_CHAT_ID"),
+            user_id=get_session_env("HERMES_SESSION_USER_ID"),
+            session_key=get_session_env("HERMES_SESSION_KEY"),
+        )
 
-    monkeypatch.setattr(review, "_run_review_in_thread", run)
-    target, _ = review.spawn_background_review_thread(object(), [], review_skills=True)
-    monkeypatch.delenv("HERMES_SESSION_PLATFORM")
-    monkeypatch.delenv("HERMES_SESSION_CHAT_ID")
-    monkeypatch.delenv("HERMES_SESSION_USER_ID")
-    monkeypatch.delenv("HERMES_SESSION_KEY")
-    target()
+    tokens = set_session_vars(
+        platform="discord", chat_id="222", user_id="333", session_key="agent:main:discord:group:222:guild-111",
+    )
+    try:
+        target = propagate_context_to_thread(read_identity)
+    finally:
+        clear_session_vars(tokens)
+    worker = threading.Thread(target=target)
+    worker.start()
+    worker.join()
+
     assert captured == {
         "platform": "discord",
         "chat_id": "222",
         "user_id": "333",
-        "session_key": "agent:main:discord:guild-111",
+        "session_key": "agent:main:discord:group:222:guild-111",
     }
+
+
+def test_public_review_fork_only_keeps_reviewed_skill_tools(monkeypatch):
+    import tools.public_skill_policy as policy
+    from tools.public_skill_review import public_review_scope
+
+    monkeypatch.setattr(policy, "is_public_discord_context", lambda: True)
+    whitelist, reset = public_review_scope(
+        _Parent(), {"skills_list", "skill_view", "skill_manage", "read_file", "search_files", "memory"},
+    )
+    assert policy._REVIEW_CALLBACK.get() is not None
+    reset()
+    assert policy._REVIEW_CALLBACK.get() is None
+    assert whitelist == {"skills_list", "skill_view", "skill_manage", "chatbird_memory"}
+
+
+def test_private_review_fork_keeps_its_whitelist(monkeypatch):
+    import tools.public_skill_policy as policy
+    from tools.public_skill_review import public_review_scope
+
+    monkeypatch.setattr(policy, "is_public_discord_context", lambda: False)
+    whitelist, reset = public_review_scope(_Parent(), {"skill_manage", "read_file"})
+    reset()
+    assert whitelist == {"skill_manage", "read_file"}

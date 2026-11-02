@@ -1,60 +1,68 @@
 diff --git a/plugins/platforms/discord/adapter.py b/plugins/platforms/discord/adapter.py
+index 634d0b2b6c..da9b8cadbd 100644
 --- a/plugins/platforms/discord/adapter.py
 +++ b/plugins/platforms/discord/adapter.py
-@@ -1030,12 +1030,22 @@ class DiscordAdapter(BasePlatformAdapter):
-                     # "all" falls through; bot is permitted — skip the
-                     # human-user allowlist below (bots aren't in it).
-                 else:
-+                    # ChatBird deliberately records DMs without dispatching
-+                    # them to the agent.  This runs before the normal
-+                    # allowlist so an unknown user cannot make an unlogged DM
-+                    # disappear, while the early return guarantees that DMs
-+                    # never receive a reply.
-+                    _msg_guild = getattr(message, "guild", None)
-+                    _is_dm = isinstance(message.channel, discord.DMChannel) or _msg_guild is None
-+                    if _is_dm and os.getenv("CHATBIRD_DISABLE_DM_REPLIES", "true").lower() in {"true", "1", "yes"}:
-+                        if os.getenv("CHATBIRD_LOG_DMS", "true").lower() in {"true", "1", "yes"}:
-+                            await adapter_self._log_chatbird_dm(message)
-+                        return
-+
-                     # Non-bot: enforce the configured user/role allowlists.
-                     # Pass guild + is_dm so role checks are scoped to the
-                     # originating guild (prevents cross-guild DM bypass, see
-                     # _is_allowed_user docstring).
--                    _msg_guild = getattr(message, "guild", None)
--                    _is_dm = isinstance(message.channel, discord.DMChannel) or _msg_guild is None
-                     if not self._is_allowed_user(
-                         str(message.author.id),
-                         message.author,
-@@ -2762,6 +2772,10 @@ class DiscordAdapter(BasePlatformAdapter):
-         # (see AGENTS.md pitfall #17 — same pattern as gateway.run).
-         allowed_users = getattr(self, "_allowed_user_ids", set())
+@@ -1684,6 +1684,15 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
+         msg_guild = getattr(message, "guild", None)
+         if msg_guild is not None and self._discord_guild_denied(msg_guild):
+             return False, False
++        is_bot = getattr(message.author, "bot", False)
++        is_dm = isinstance(message.channel, discord.DMChannel) or (msg_guild is None and not is_bot)
++        if is_dm and self._chatbird_dm_replies_disabled():
++            # Live and recovered messages both pass here, so a DM never reaches the agent. Runs before
++            # the allowlist so an unknown user cannot make an unlogged DM disappear. Only a human's
++            # live message is recorded: a recovered copy was already seen.
++            if claim and not is_bot:
++                self._schedule_chatbird_dm_log(message)
++            return False, False
+         role_authorized = False
+         if getattr(message.author, "bot", False):
+             allow_bots = self._get_allow_bots()
+@@ -1703,8 +1712,6 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
+             ):
+                 return False, False
+         else:
+-            msg_guild = getattr(message, "guild", None)
+-            is_dm = isinstance(message.channel, discord.DMChannel) or msg_guild is None
+             msg_channel_ids = None
+             if not is_dm:
+                 msg_channel_ids = {str(message.channel.id)}
+@@ -4120,6 +4127,10 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
          allowed_roles = getattr(self, "_allowed_role_ids", set())
-+        if os.getenv("DISCORD_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
-+            return True
-+        if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
-+            return True
          has_users = bool(allowed_users)
          has_roles = bool(allowed_roles)
-         if not has_users and not has_roles:
-@@ -2815,4 +2829,55 @@ class DiscordAdapter(BasePlatformAdapter):
++        # ChatBird opens guild channels to every member while DISCORD_ALLOWED_USERS keeps naming the
++        # owner for component authorization, so allow-all must win over that list.
++        if self._discord_allow_all_users() or self._gateway_allow_all_users():
++            return True
+         # Pairing is a first-class grant in the gateway auth union; honor it here too.
+         if self._is_pairing_approved_user(user_id):
+             return True
+@@ -4179,6 +4190,57 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
          m_roles = getattr(m, "roles", None) or []
          return any(getattr(r, "id", None) in allowed_roles for r in m_roles)
  
++    @staticmethod
++    def _chatbird_dm_replies_disabled() -> bool:
++        return os.getenv("CHATBIRD_DISABLE_DM_REPLIES", "true").strip().lower() in {"true", "1", "yes"}
++
++    def _schedule_chatbird_dm_log(self, message: DiscordMessage) -> None:
++        """Record a human DM off the ingress path, unless ``CHATBIRD_LOG_DMS`` turns it off."""
++        if os.getenv("CHATBIRD_LOG_DMS", "true").strip().lower() not in {"true", "1", "yes"}:
++            return
++        task = asyncio.get_running_loop().create_task(self._log_chatbird_dm(message))
++        self._background_tasks.add(task)
++        task.add_done_callback(self._background_tasks.discard)
++
 +    async def _log_chatbird_dm(self, message: DiscordMessage) -> None:
 +        """Append a bounded, mode-0600 DM record without invoking Hermes.
 +
-+        The log intentionally stores text and attachment metadata only; it
-+        does not download arbitrary DM files.  The administrator can inspect
-+        this file from the private admin channel with the normal admin tools.
++        The log stores text and attachment metadata only; it never downloads a DM file. The
++        administrator can inspect this file from the private admin channel with the admin tools.
 +        """
-+        try:
-+            from hermes_constants import get_hermes_home
++        from hermes_constants import get_hermes_home
 +
-+            path = get_hermes_home() / "logs" / "chatbird-discord-dm.jsonl"
-+        except Exception:
-+            path = _Path.home() / ".hermes" / "logs" / "chatbird-discord-dm.jsonl"
-+
++        path = get_hermes_home() / "logs" / "chatbird-discord-dm.jsonl"
 +        entry = {
 +            "timestamp": getattr(getattr(message, "created_at", None), "isoformat", lambda: "")(),
 +            "message_id": str(getattr(message, "id", "") or ""),
@@ -76,20 +84,15 @@ diff --git a/plugins/platforms/discord/adapter.py b/plugins/platforms/discord/ad
 +        def _append() -> None:
 +            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
 +            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-+            try:
-+                with os.fdopen(fd, "a", encoding="utf-8") as stream:
-+                    os.chmod(path, 0o600)
-+                    stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
-+            except Exception:
-+                try:
-+                    os.close(fd)
-+                except OSError:
-+                    pass
-+                raise
++            with os.fdopen(fd, "a", encoding="utf-8") as stream:
++                os.chmod(path, 0o600)
++                stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
 +
 +        try:
 +            await asyncio.to_thread(_append)
 +        except Exception:
 +            logger.warning("[%s] Failed to record a Discord DM", self.name, exc_info=True)
 +
-     # ── Slash command authorization ─────────────────────────────────────
+     def _warn_if_fail_closed_default(self) -> None:
+         """Log once when Discord is rejecting traffic with no allowlist set."""
+         if getattr(self, "_warned_fail_closed_default", False):

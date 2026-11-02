@@ -3,11 +3,40 @@
 # deployed guild-isolation patch still keeps different Discord servers apart.
 group_sessions_per_user: false
 
+# A MEDIA: line in a reply uploads that file. Only Hermes's cache directories may
+# be delivered, and .env must carry no HERMES_MEDIA_* line.
+gateway:
+  strict: true
+  trust_recent_files: false
+
+# Tool progress cards would show internal tool calls in a public channel.
+display:
+  tool_progress: false
+
+# The policy plugin bounds its own prompt; a spilled policy would stop applying.
+hooks:
+  output_spill:
+    enabled: false
+
+# Hermes hides plugin tools behind a tool_search bridge by default, and the policy
+# gate allows only named tools. Runtime installs and the connector gateway stay off.
+tools:
+  tool_search:
+    enabled: "off"
+  connectors:
+    enabled: false
+
+security:
+  allow_lazy_installs: false
+
 web:
   # Free, no-key search plus request-driven extraction. simple-http handles
   # static HTML/text/JSON/XML and rejects private networks and oversized data.
   search_backend: ddgs
   extract_backend: simple-http
+  # A failed call must not fall through to the anonymous third-party tiers.
+  keyless_fallback: false
+  keyless_rescue: false
   # Keep browser automation internal to web_search/web_extract. The local
   # Chromium fallback starts only after the primary provider fails and closes
   # after one fixed DOM read; it is suitable for a small, low-traffic host.
@@ -66,7 +95,7 @@ memory:
   # A shared USER.md would mix multiple members in one guild, so leave it off.
   user_profile_enabled: false
 
-# Adapter-specific options live in the platform extra block in Hermes 0.17.
+# Adapter-specific options live in the platform extra block.
 platforms:
   discord:
     extra:

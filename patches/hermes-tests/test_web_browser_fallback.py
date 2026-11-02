@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 
@@ -16,7 +17,8 @@ def _enabled_config(**overrides):
 
 
 def test_browser_fallback_requires_explicit_enable_and_cloud(monkeypatch):
-    import tools.browser_tool as browser
+    import tools.browser_tool_cloud as browser_cloud
+    import tools.browser_tool_install as browser_install
     import tools.web_browser_fallback as fallback
 
     monkeypatch.setattr(fallback, "_fallback_config", lambda: {})
@@ -25,11 +27,11 @@ def test_browser_fallback_requires_explicit_enable_and_cloud(monkeypatch):
     monkeypatch.setattr(
         fallback, "_fallback_config", lambda: _enabled_config(require_cloud=True)
     )
-    monkeypatch.setattr(browser, "_get_cloud_provider", lambda: None)
-    monkeypatch.setattr(browser, "check_browser_requirements", lambda: True)
+    monkeypatch.setattr(browser_cloud, "_get_cloud_provider", lambda: None)
+    monkeypatch.setattr(browser_install, "check_browser_requirements", lambda: True)
     assert fallback.browser_backend_ready() is False
 
-    monkeypatch.setattr(browser, "_get_cloud_provider", lambda: object())
+    monkeypatch.setattr(browser_cloud, "_get_cloud_provider", lambda: object())
     assert fallback.browser_backend_ready() is True
 
 
@@ -248,6 +250,7 @@ def test_extract_uses_reader_when_browser_is_not_ready(monkeypatch):
 
 def test_browser_dom_always_cleans_up_and_rechecks_redirect(monkeypatch):
     import tools.browser_tool as browser
+    import tools.browser_tool_lifecycle as browser_lifecycle
     import tools.web_browser_fallback as fallback
 
     cleaned = []
@@ -268,7 +271,7 @@ def test_browser_dom_always_cleans_up_and_rechecks_redirect(monkeypatch):
             {"success": True, "url": "http://internal.test/", "title": "Oops"}
         ),
     )
-    monkeypatch.setattr(browser, "cleanup_browser", cleaned.append)
+    monkeypatch.setattr(browser_lifecycle, "cleanup_browser", cleaned.append)
 
     value, error = fallback._browser_dom(
         "https://public.test/",
@@ -515,6 +518,7 @@ def test_web_tool_dispatches_internal_fallback_without_browser_tool_registration
 def test_web_extract_dispatches_internal_browser_fallback(monkeypatch):
     import tools.web_browser_fallback as fallback
     import tools.web_tools as web_tools
+    import tools.web_tools_extract as web_extract
 
     class Provider:
         name = "fake-extract"
@@ -539,9 +543,8 @@ def test_web_extract_dispatches_internal_browser_fallback(monkeypatch):
         ],
     )
 
-    result = web_tools._sync_extract_with_browser_fallback(
-        Provider(), ["https://blocked.test/"], format="markdown"
-    )
+    monkeypatch.setattr(web_tools, "_load_web_config", lambda: {"keyless_rescue": False})
+    result = asyncio.run(web_extract._dispatch_extract(Provider(), ["https://blocked.test/"], "markdown"))
     assert result[0]["title"] == "Recovered"
     assert result[0]["content"] == "browser-rendered content"
 

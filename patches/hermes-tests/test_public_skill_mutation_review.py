@@ -29,7 +29,7 @@ def _public_background(tmp_path, monkeypatch, decision):
     skills_dir = tmp_path / "skills"
     skills_dir.mkdir(exist_ok=True)
     monkeypatch.setattr(manager, "SKILLS_DIR", skills_dir)
-    monkeypatch.setattr(manager, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr("agent.skill_utils.get_all_skills_dirs", lambda: [skills_dir])
     monkeypatch.setattr(policy, "_manifest_path", lambda: tmp_path / "approvals.json")
     monkeypatch.setattr(policy, "is_public_discord_context", lambda: True)
@@ -161,11 +161,9 @@ def test_public_policy_error_rejects_delete_without_touching_skill(tmp_path, mon
         tmp_path, monkeypatch, ReviewDecision(True, "safe", "reviewer")
     ) as (skills_dir, _policy, manager):
         skill_dir = _install(skills_dir)
-        monkeypatch.setattr(
-            manager,
-            "_is_background_discord_origin",
-            lambda: True,
-        )
+        import tools.public_skill_review as public_review
+
+        monkeypatch.setattr(public_review, "_is_background_discord_origin", lambda: True)
         import builtins
 
         real_import = builtins.__import__
@@ -180,3 +178,71 @@ def test_public_policy_error_rejects_delete_without_touching_skill(tmp_path, mon
         assert result["success"] is False
         assert "deletion was rejected" in result["error"]
         assert skill_dir.exists()
+
+
+def test_batch_shape_cannot_skip_public_review(tmp_path, monkeypatch):
+    """The advertised skill_manage call is an operations array."""
+    from tools.public_skill_policy import ReviewDecision
+
+    with _public_background(
+        tmp_path, monkeypatch, ReviewDecision(False, "review rejected", "reviewer")
+    ) as (skills_dir, policy, manager):
+        skill_dir = _install(skills_dir)
+        assert policy.record_public_approval(
+            skill_dir, "public-research", reviewer="initial", reason="safe"
+        )
+        patch = {
+            "action": "patch", "name": "public-research",
+            "old_string": "current facts", "new_string": "recent public facts",
+        }
+        rejected = json.loads(manager.skill_manage("", "", operations=[patch]))
+        assert rejected["success"] is False
+        assert rejected["public_review"] == "rejected"
+        assert (skill_dir / "SKILL.md").read_text(encoding="utf-8") == SAFE
+
+        created = {"action": "create", "name": "other-skill", "content": SAFE}
+        assert json.loads(manager.skill_manage("", "", operations=[created]))["success"] is False
+        assert not (skills_dir / "other-skill").exists()
+
+        multi = json.loads(manager.skill_manage("", "", operations=[patch, patch]))
+        assert multi["success"] is False
+        assert "one operation" in multi["error"]
+        assert (skill_dir / "SKILL.md").read_text(encoding="utf-8") == SAFE
+
+
+def test_batch_patch_publishes_after_approval(tmp_path, monkeypatch):
+    from tools.public_skill_policy import ReviewDecision
+
+    with _public_background(
+        tmp_path, monkeypatch, ReviewDecision(True, "safe", "reviewer")
+    ) as (skills_dir, policy, manager):
+        skill_dir = _install(skills_dir)
+        assert policy.record_public_approval(
+            skill_dir, "public-research", reviewer="initial", reason="safe"
+        )
+        result = json.loads(manager.skill_manage("", "", operations=[{
+            "action": "patch", "name": "public-research",
+            "old_string": "current facts", "new_string": "recent public facts",
+        }]))
+        assert result["success"] is True
+        assert (skill_dir / "SKILL.md").read_text(encoding="utf-8") == UPDATED
+        assert policy.is_skill_publicly_approved(skill_dir, "public-research")
+
+
+def test_admin_background_review_of_an_approved_skill_still_needs_review(tmp_path, monkeypatch):
+    from tools.public_skill_policy import ReviewDecision
+
+    with _public_background(
+        tmp_path, monkeypatch, ReviewDecision(False, "review rejected", "reviewer")
+    ) as (skills_dir, policy, manager):
+        monkeypatch.setattr(policy, "is_public_discord_context", lambda: False)
+        skill_dir = _install(skills_dir)
+        assert policy.record_public_approval(
+            skill_dir, "public-research", reviewer="initial", reason="safe"
+        )
+        result = json.loads(manager.skill_manage("", "", operations=[{
+            "action": "patch", "name": "public-research",
+            "old_string": "current facts", "new_string": "recent public facts",
+        }]))
+        assert result["success"] is False
+        assert (skill_dir / "SKILL.md").read_text(encoding="utf-8") == SAFE

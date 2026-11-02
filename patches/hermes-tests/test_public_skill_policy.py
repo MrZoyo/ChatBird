@@ -232,13 +232,11 @@ def test_public_prompt_index_only_contains_hash_approved_skills(tmp_path, monkey
     import agent.prompt_builder as prompts
     import tools.public_skill_policy as policy
 
-    skills_dir = tmp_path / "skills"
     visible = _skill(tmp_path, "visible")
     _skill(tmp_path, "hidden")
     monkeypatch.setattr(policy, "_manifest_path", lambda: tmp_path / "approvals.json")
     monkeypatch.setattr(policy, "is_public_discord_context", lambda: True)
-    monkeypatch.setattr(prompts, "get_skills_dir", lambda: skills_dir)
-    monkeypatch.setattr(prompts, "get_all_skills_dirs", lambda: [skills_dir])
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     assert policy.record_public_approval(visible, "visible", reviewer="test", reason="safe")
     prompts.clear_skills_system_prompt_cache(clear_snapshot=True)
 

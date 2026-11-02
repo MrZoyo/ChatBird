@@ -1,6 +1,8 @@
+import asyncio
 import json
 import stat
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -32,6 +34,8 @@ def _interaction(
 @pytest.fixture
 def slash_adapter(monkeypatch):
     monkeypatch.setenv("DISCORD_ALLOW_ALL_USERS", "true")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    monkeypatch.setenv("DISCORD_HISTORY_BACKFILL", "false")
     monkeypatch.setenv(
         "DISCORD_ALLOWED_CHANNELS",
         "1146359015715110992,1154706638901612625,1220876330913234944",
@@ -111,12 +115,23 @@ def test_admin_slash_command_rejects_wrong_guild_channel_pair(slash_adapter):
 
 
 def test_slash_commands_are_disabled_in_dms(slash_adapter):
+    import discord
+
+    interaction = _interaction("518184812381732865", guild_id=None)
+    interaction.channel = object.__new__(discord.DMChannel)
+    allowed, reason = slash_adapter._evaluate_slash_authorization(interaction, "/help")
+
+    assert allowed is False
+    assert "disabled in DMs" in reason
+
+
+def test_slash_command_without_a_guild_is_denied(slash_adapter):
     allowed, reason = slash_adapter._evaluate_slash_authorization(
         _interaction("518184812381732865", guild_id=None), "/help",
     )
 
     assert allowed is False
-    assert "guild id missing" in reason
+    assert "allowed_guilds" in reason
 
 
 def test_missing_slash_command_text_fails_closed(slash_adapter):
@@ -179,3 +194,150 @@ async def test_chatbird_dm_log_is_private_and_does_not_download_attachments(
         },
     ]
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def _message(*, channel, guild, user_id=999, content="hello", bot=False, message_type=None):
+    import discord
+
+    return SimpleNamespace(
+        id=123, type=message_type or discord.MessageType.default, content=content, channel=channel, guild=guild,
+        author=SimpleNamespace(id=user_id, name="Alice", display_name="Alice", bot=bot, roles=[]),
+        mentions=[], attachments=[], reference=None,
+        created_at=SimpleNamespace(isoformat=lambda: "2026-11-02T00:00:00+00:00"),
+    )
+
+
+@pytest.fixture
+def ingress_adapter(monkeypatch, tmp_path):
+    import discord
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("DISCORD_ALLOW_ALL_USERS", "true")
+    monkeypatch.setenv("DISCORD_ALLOWED_GUILDS", "100")
+    monkeypatch.delenv("CHATBIRD_DISABLE_DM_REPLIES", raising=False)
+    monkeypatch.delenv("CHATBIRD_LOG_DMS", raising=False)
+    adapter = _adapter()
+    adapter._client = SimpleNamespace(user=SimpleNamespace(id=1))
+    adapter._ready_event = SimpleNamespace(is_set=lambda: True)
+    adapter._background_tasks = set()
+    adapter._dedup = SimpleNamespace(is_duplicate=lambda _id: False, contains=lambda _id: False)
+    adapter._self_is_explicitly_mentioned = lambda _message: True
+    adapter._record_bot_tag_debounce = lambda _message: None
+    adapter._handle_message = AsyncMock(return_value=True)
+    return adapter, discord
+
+
+@pytest.mark.asyncio
+async def test_dm_is_logged_and_never_dispatched(ingress_adapter, tmp_path):
+    adapter, discord = ingress_adapter
+    channel = object.__new__(discord.DMChannel)
+    message = _message(channel=channel, guild=None)
+
+    assert await adapter._dispatch_discord_message(message) is False
+    await asyncio.gather(*adapter._background_tasks)
+
+    adapter._handle_message.assert_not_awaited()
+    log = tmp_path / ".hermes" / "logs" / "chatbird-discord-dm.jsonl"
+    assert json.loads(log.read_text(encoding="utf-8"))["content"] == "hello"
+
+
+@pytest.mark.asyncio
+async def test_recovered_dm_is_not_dispatched_or_logged_again(ingress_adapter, tmp_path):
+    adapter, discord = ingress_adapter
+    channel = object.__new__(discord.DMChannel)
+    admitted, _role = adapter._discord_message_admission(_message(channel=channel, guild=None), claim=False)
+
+    assert admitted is False
+    assert not (tmp_path / ".hermes" / "logs" / "chatbird-discord-dm.jsonl").exists()
+
+
+@pytest.mark.asyncio
+async def test_unknown_guild_message_never_reaches_dispatch(ingress_adapter):
+    adapter, _discord = ingress_adapter
+    message = _message(channel=SimpleNamespace(id=5), guild=SimpleNamespace(id=200))
+
+    assert await adapter._dispatch_discord_message(message) is False
+    adapter._handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_allowed_guild_message_reaches_dispatch(ingress_adapter):
+    adapter, _discord = ingress_adapter
+    message = _message(channel=SimpleNamespace(id=5), guild=SimpleNamespace(id=100))
+
+    assert await adapter._dispatch_discord_message(message) is True
+    adapter._handle_message.assert_awaited_once()
+
+
+def test_skill_autocomplete_uses_the_command_gate(slash_adapter):
+    member = _interaction("999999999999999999")
+    assert slash_adapter._evaluate_slash_authorization(member, "/skill")[0] is False
+    admin = _interaction("518184812381732865", channel_id="1154706638901612625")
+    assert slash_adapter._evaluate_slash_authorization(admin, "/skill")[0] is True
+
+
+@pytest.mark.parametrize(
+    "user_id, channel_id, text, command",
+    [
+        ("999999999999999999", "1146359015715110992", "/restart", None),
+        ("999999999999999999", "1146359015715110992", "/some-private-skill go", None),
+        ("518184812381732865", "1146359015715110992", "/restart", None),
+        ("518184812381732865", "1154706638901612625", "/restart", "restart"),
+        ("999999999999999999", "1146359015715110992", "/status", "status"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_typed_commands_pass_the_same_gate_as_native_ones(slash_adapter, user_id, channel_id, text, command):
+    """A denied "@bot /restart" reaches the gateway as plain chat, with no command to dispatch."""
+    from gateway.config import Platform, PlatformConfig
+    from plugins.platforms.discord.adapter import DiscordAdapter
+
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="fake"))
+    adapter._client = SimpleNamespace(user=SimpleNamespace(id=7))
+    adapter._text_batch_delay_seconds = 0
+    adapter.handle_message = AsyncMock()
+    guild = SimpleNamespace(id=1146359014968537089, name="Bird Gaming")
+    channel = SimpleNamespace(id=int(channel_id), name="general", guild=guild, topic=None)
+    message = _message(channel=channel, guild=guild, user_id=int(user_id), content=f"<@7> {text}")
+    message.mentions = [adapter._client.user]
+
+    await adapter._handle_message(message)
+
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.platform == Platform.DISCORD
+    assert event.get_command() == command
+    assert event.allow_gateway_control is (command is not None)
+
+
+@pytest.mark.asyncio
+async def test_ordinary_chat_keeps_gateway_control(slash_adapter):
+    from gateway.config import PlatformConfig
+    from plugins.platforms.discord.adapter import DiscordAdapter
+
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="fake"))
+    adapter._client = SimpleNamespace(user=SimpleNamespace(id=7))
+    adapter._text_batch_delay_seconds = 0
+    adapter.handle_message = AsyncMock()
+    guild = SimpleNamespace(id=1146359014968537089, name="Bird Gaming")
+    channel = SimpleNamespace(id=1146359015715110992, name="general", guild=guild, topic=None)
+    message = _message(channel=channel, guild=guild, content="<@7> hello")
+    message.mentions = [adapter._client.user]
+
+    await adapter._handle_message(message)
+
+    assert adapter.handle_message.await_args.args[0].allow_gateway_control is True
+
+
+@pytest.mark.parametrize(
+    "text, allowed",
+    [("/restart", False), ("/skill", False), ("/model", False), ("/status", True), ("/help", True)],
+)
+def test_lost_admin_settings_close_the_gate_on_a_chatbird_deployment(monkeypatch, text, allowed):
+    monkeypatch.delenv("CHATBIRD_ADMIN_USERS", raising=False)
+    monkeypatch.delenv("CHATBIRD_ADMIN_CHANNELS", raising=False)
+    monkeypatch.setenv("DISCORD_ALLOWED_GUILDS", "1146359014968537089")
+    monkeypatch.setenv("DISCORD_ALLOW_ALL_USERS", "true")
+
+    result, _reason = _adapter()._evaluate_slash_authorization(_interaction("518184812381732865"), text)
+
+    assert result is allowed

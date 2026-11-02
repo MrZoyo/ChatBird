@@ -1,26 +1,23 @@
-diff --git a/gateway/run.py b/gateway/run.py
---- a/gateway/run.py
-+++ b/gateway/run.py
-@@ -10073,7 +10073,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
-                 context_prompt += _intro_note
-         
-         # One-time prompt if no home channel is set for this platform
-         # Skip for webhooks - they deliver directly to configured targets (github_comment, etc.)
--        if not history and source.platform and source.platform != Platform.LOCAL and source.platform != Platform.WEBHOOK:
-+        _suppress_home_notice = (
-+            source.platform == Platform.DISCORD
-+            and os.getenv("CHATBIRD_DISABLE_HOME_CHANNEL_NOTICE", "").strip().lower()
-+            in {"true", "1", "yes"}
-+        )
-+        if not history and source.platform and source.platform != Platform.LOCAL and source.platform != Platform.WEBHOOK and not _suppress_home_notice:
-             platform_name = source.platform.value
-             env_key = _home_target_env_var(platform_name)
-             if not os.getenv(env_key):
+diff --git a/gateway/run_turn_prepare.py b/gateway/run_turn_prepare.py
+index e919ad71bb..69b26ae941 100644
+--- a/gateway/run_turn_prepare.py
++++ b/gateway/run_turn_prepare.py
+@@ -551,6 +551,9 @@ class GatewayTurnPrepareMixin:
+         # One-time prompt if no home channel is set (webhooks deliver to configured targets instead).
+         if not human_platform:
+             return
++        if (source.platform == Platform.DISCORD
++                and os.getenv("CHATBIRD_DISABLE_HOME_CHANNEL_NOTICE", "").strip().lower() in {"true", "1", "yes"}):
++            return
+         platform_name = source.platform.value
+         env_key = _home_target_env_var(platform_name)
+         # Multiplex: the home channel may live only in the profile secret scope, not os.environ.
 diff --git a/tests/gateway/test_status_command.py b/tests/gateway/test_status_command.py
+index 26ed235909..3b17578475 100644
 --- a/tests/gateway/test_status_command.py
 +++ b/tests/gateway/test_status_command.py
-@@ -476,6 +476,48 @@ async def test_first_run_non_slack_home_channel_onboarding_keeps_direct_command(
-     assert "Type /sethome" in onboarding
+@@ -469,6 +469,48 @@ async def test_first_run_slack_home_channel_onboarding_uses_parent_command(monke
+     assert "Type /sethome" not in onboarding
  
  
 +@pytest.mark.asyncio
@@ -66,5 +63,5 @@ diff --git a/tests/gateway/test_status_command.py b/tests/gateway/test_status_co
 +
 +
  @pytest.mark.asyncio
- async def test_handle_message_discards_stale_result_after_session_invalidation(monkeypatch):
+ async def test_handle_message_stale_result_keeps_newer_generation_callback(monkeypatch):
      import gateway.run as gateway_run

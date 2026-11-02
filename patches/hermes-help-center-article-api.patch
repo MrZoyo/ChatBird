@@ -1,5 +1,5 @@
 diff --git a/tools/web_browser_fallback.py b/tools/web_browser_fallback.py
-index 9bd00325..ff8cea2d 100644
+index f8d72e63b4..01033d0cc8 100644
 --- a/tools/web_browser_fallback.py
 +++ b/tools/web_browser_fallback.py
 @@ -9,6 +9,7 @@ then closes the session.  Public callers continue to invoke only
@@ -24,7 +24,7 @@ index 9bd00325..ff8cea2d 100644
  _NON_RETRYABLE_ERROR_MARKERS = (
      "blocked:",
      "http 429",
-@@ -193,7 +201,11 @@ def _safe_public_url(url: str) -> bool:
+@@ -194,7 +202,11 @@ def _safe_public_url(url: str) -> bool:
  
  def _configured_reader_hosts(config: Dict[str, Any]) -> set[str]:
      """Return the explicit host allowlist for the optional read-only service."""
@@ -37,7 +37,7 @@ index 9bd00325..ff8cea2d 100644
      if isinstance(raw, str):
          raw = [part.strip() for part in raw.split(",")]
      if not isinstance(raw, (list, tuple, set)):
-@@ -213,6 +225,95 @@ def _reader_host_allowed(url: str, config: Dict[str, Any]) -> bool:
+@@ -214,6 +226,95 @@ def _reader_host_allowed(url: str, config: Dict[str, Any]) -> bool:
      return bool(host and host in _configured_reader_hosts(config))
  
  
@@ -133,7 +133,7 @@ index 9bd00325..ff8cea2d 100644
  def _reader_extract(
      url: str, *, min_chars: int, max_chars: int
  ) -> tuple[Optional[Dict[str, str]], Optional[str]]:
-@@ -434,6 +535,22 @@ def maybe_extract_with_browser(
+@@ -435,6 +536,22 @@ def maybe_extract_with_browser(
          if not url or not _safe_public_url(url):
              continue
          attempted += 1
@@ -156,7 +156,7 @@ index 9bd00325..ff8cea2d 100644
          if browser_ready:
              browser_value, browser_error = _browser_dom(
                  url,
-@@ -469,9 +586,10 @@ def maybe_extract_with_browser(
+@@ -470,9 +587,10 @@ def maybe_extract_with_browser(
                  }
              else:
                  logger.info(

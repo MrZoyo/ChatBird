@@ -1,12 +1,11 @@
 diff --git a/plugins/platforms/discord/adapter.py b/plugins/platforms/discord/adapter.py
+index 5c4b1a8e7b..ba98233f51 100644
 --- a/plugins/platforms/discord/adapter.py
 +++ b/plugins/platforms/discord/adapter.py
-@@ -1097,6 +1097,11 @@ class DiscordAdapter(BasePlatformAdapter):
--
-+
-                 await self._handle_message(message, role_authorized=_role_authorized)
--
-+
+@@ -1553,6 +1553,11 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
+             async def on_thread_update(before, after):
+                 await adapter_self._on_platform_thread_update(before, after)
+ 
 +            @self._client.event
 +            async def on_guild_channel_delete(channel):
 +                """Stop in-flight work whose Discord channel no longer exists."""
@@ -15,48 +14,28 @@ diff --git a/plugins/platforms/discord/adapter.py b/plugins/platforms/discord/ad
              @self._client.event
              async def on_voice_state_update(member, before, after):
                  """Track voice channel join/leave events."""
-@@ -2950,12 +2950,12 @@ class DiscordAdapter(BasePlatformAdapter):
-             channel_ids: set = set()
-             if chan_id_raw is not None:
-                 channel_ids.add(str(chan_id_raw))
--                # Mirror on_message: also test the parent channel for threads
--                # so per-channel allow/deny lists work consistently.
--                if isinstance(chan_obj, discord.Thread):
--                    parent_id = self._get_parent_channel_id(chan_obj)
--                    if parent_id:
--                        channel_ids.add(str(parent_id))
-+                # Mirror on_message: also test a thread's parent channel or a
-+                # guild channel's containing category so allow/deny lists work
-+                # consistently across message and slash-command surfaces.
-+                parent_id = self._get_parent_channel_id(chan_obj)
-+                if parent_id:
-+                    channel_ids.add(str(parent_id))
--
-+
-             allowed_raw = os.getenv("DISCORD_ALLOWED_CHANNELS", "")
-             if allowed_raw:
-@@ -5159,13 +5164,71 @@ class DiscordAdapter(BasePlatformAdapter):
-             return SendResult(success=False, error=str(e))
--
-+
-     def _get_parent_channel_id(self, channel: Any) -> Optional[str]:
--        """Return the parent channel ID for a Discord thread-like channel, if present."""
-+        """Return a thread parent or guild channel category ID, if present."""
-         parent = getattr(channel, "parent", None)
-         if parent is not None and getattr(parent, "id", None) is not None:
-             return str(parent.id)
-         parent_id = getattr(channel, "parent_id", None)
-         if parent_id is not None:
+@@ -5265,6 +5270,17 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
+         if parent_name:
+             keys.add(parent_name)
+             keys.add(f"#{parent_name}")
++        # An ordinary guild channel, including a voice channel's built-in chat, inherits its category.
++        # A thread inherits only its parent channel. discord.py exposes these as different attributes.
++        if not parent_id and parent_channel is None:
++            category = getattr(channel, "category", None)
++            category_id = getattr(category, "id", None) or getattr(channel, "category_id", None)
++            if category_id is not None:
++                keys.add(str(category_id))
++            category_name = str(getattr(category, "name", "")).strip() if category else ""
++            if category_name:
++                keys.add(category_name)
++                keys.add(f"#{category_name}")
+         return keys
+ 
+     def _discord_thread_require_mention(self) -> bool:
+@@ -5946,6 +5962,46 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
              return str(parent_id)
-+        category = getattr(channel, "category", None)
-+        if category is not None and getattr(category, "id", None) is not None:
-+            return str(category.id)
-+        category_id = getattr(channel, "category_id", None)
-+        if category_id is not None:
-+            return str(category_id)
          return None
--
-+
+ 
 +    @staticmethod
 +    def _session_key_targets_discord_channel(session_key: str, channel_id: str) -> bool:
 +        """Return whether a session key belongs to a Discord guild channel."""
@@ -70,71 +49,48 @@ diff --git a/plugins/platforms/discord/adapter.py b/plugins/platforms/discord/ad
 +        )
 +
 +    async def _cancel_deleted_channel_sessions(self, channel: Any) -> int:
-+        """Cancel live and buffered turns for a deleted Discord guild channel.
-+
-+        Persistent transcripts remain available under the normal Hermes
-+        retention policy. A newly created temporary channel receives a new
-+        Discord snowflake and therefore a separate session key.
-+        """
++        """Cancel live and buffered turns for a deleted Discord guild channel. Transcripts stay under
++        the normal retention policy; a new temporary channel has a new snowflake, so a new session."""
 +        channel_id = getattr(channel, "id", None)
 +        if channel_id is None:
 +            return 0
-+
 +        candidate_keys = set(self._active_sessions)
 +        candidate_keys.update(self._pending_messages)
 +        candidate_keys.update(self._text_debounce_store())
 +        candidate_keys.update(self._pending_text_batches)
 +        candidate_keys.update(self._pending_text_batch_tasks)
 +        target_keys = {
-+            key
-+            for key in candidate_keys
++            key for key in candidate_keys
 +            if self._session_key_targets_discord_channel(key, str(channel_id))
 +        }
-+
 +        for key in target_keys:
 +            batch_task = self._pending_text_batch_tasks.pop(key, None)
 +            if batch_task is not None and not batch_task.done():
 +                batch_task.cancel()
 +            self._pending_text_batches.pop(key, None)
-+
 +        if target_keys:
-+            await asyncio.gather(
-+                *(self.cancel_session_processing(key) for key in target_keys)
-+            )
++            await asyncio.gather(*(self.cancel_session_processing(key) for key in target_keys))
 +            logger.info(
 +                "[%s] Stopped %d session(s) for deleted Discord channel %s",
-+                self.name,
-+                len(target_keys),
-+                channel_id,
++                self.name, len(target_keys), channel_id,
 +            )
 +        return len(target_keys)
 +
      def _is_forum_parent(self, channel: Any) -> bool:
-@@ -5370,11 +5376,10 @@ class DiscordAdapter(BasePlatformAdapter):
-         #   discord.auto_thread: Auto-create thread on @mention in channels (default: true)
- 
-         thread_id = None
--        parent_channel_id = None
-+        parent_channel_id = self._get_parent_channel_id(message.channel)
-         is_thread = isinstance(message.channel, discord.Thread)
-         if is_thread:
-             thread_id = str(message.channel.id)
--            parent_channel_id = self._get_parent_channel_id(message.channel)
- 
-         is_voice_linked_channel = False
- 
+         """Best-effort check for whether a Discord channel is a forum channel."""
+         if channel is None:
 diff --git a/tests/gateway/test_discord_channel_controls.py b/tests/gateway/test_discord_channel_controls.py
+index 96e3dc4def..048564ecea 100644
 --- a/tests/gateway/test_discord_channel_controls.py
 +++ b/tests/gateway/test_discord_channel_controls.py
 @@ -1,5 +1,6 @@
  """Tests for Discord ignored_channels and no_thread_channels config."""
--
-+
+ 
 +import asyncio
  from types import SimpleNamespace
- from datetime import datetime, timezone
+ from datetime import datetime, timezone, UTC
  from unittest.mock import AsyncMock, MagicMock
-@@ -56,11 +56,23 @@ class FakeDMChannel:
+@@ -56,13 +57,25 @@ class FakeDMChannel:
  
  
  class FakeTextChannel:
@@ -160,16 +116,19 @@ diff --git a/tests/gateway/test_discord_channel_controls.py b/tests/gateway/test
 +
 +
  class FakeThread:
-@@ -100,6 +112,104 @@ def make_message(*, channel, content: str, mentions=None):
+     def __init__(self, channel_id: int = 1, name: str = "thread", parent=None, guild_name: str = "Hermes Server"):
+         self.id = channel_id
+@@ -100,6 +113,111 @@ def make_message(*, channel, content: str, mentions=None):
      )
  
  
 +# ── allowed_channels ─────────────────────────────────────────────────
 +
 +
++@pytest.mark.parametrize("channel_type", [FakeTextChannel, FakeVoiceChannel])
 +@pytest.mark.asyncio
-+async def test_allowed_category_processes_child_text_channel(adapter, monkeypatch):
-+    """Text channels inherit allowed_channels membership from their category."""
++async def test_allowed_category_processes_child_channel(adapter, monkeypatch, channel_type):
++    """A guild channel, including a voice channel's chat, inherits its category's allowlist entry."""
 +    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "500")
 +    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
 +    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
@@ -177,10 +136,9 @@ diff --git a/tests/gateway/test_discord_channel_controls.py b/tests/gateway/test
 +    monkeypatch.delenv("DISCORD_IGNORED_CHANNELS", raising=False)
 +    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
 +
-+    category = SimpleNamespace(id=500)
 +    bot_user = adapter._client.user
 +    message = make_message(
-+        channel=FakeTextChannel(channel_id=501, category=category),
++        channel=channel_type(channel_id=501, category=SimpleNamespace(id=500)),
 +        content=f"<@{bot_user.id}> hello",
 +        mentions=[bot_user],
 +    )
@@ -190,37 +148,44 @@ diff --git a/tests/gateway/test_discord_channel_controls.py b/tests/gateway/test
 +
 +
 +@pytest.mark.asyncio
-+async def test_allowed_category_processes_voice_channel_chat(adapter, monkeypatch):
-+    """A voice channel's built-in text chat inherits its category allowlist."""
++async def test_channel_outside_the_allowed_category_stays_denied(adapter, monkeypatch):
 +    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "500")
 +    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
-+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
-+    monkeypatch.setenv("DISCORD_HISTORY_BACKFILL", "false")
 +    monkeypatch.delenv("DISCORD_IGNORED_CHANNELS", raising=False)
-+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
 +
-+    category = SimpleNamespace(id=500)
 +    bot_user = adapter._client.user
 +    message = make_message(
-+        channel=FakeVoiceChannel(channel_id=501, category=category),
++        channel=FakeTextChannel(channel_id=501, category=SimpleNamespace(id=600)),
 +        content=f"<@{bot_user.id}> hello",
 +        mentions=[bot_user],
 +    )
 +    await adapter._handle_message(message)
 +
-+    adapter.handle_message.assert_awaited_once()
++    adapter.handle_message.assert_not_awaited()
++
++
++def test_thread_inherits_its_parent_channel_but_not_a_category(adapter):
++    """A thread reads parent/parent_id. Its category must not widen the channel allowlist."""
++    parent = FakeTextChannel(channel_id=501, category=SimpleNamespace(id=500))
++    thread = FakeThread(channel_id=601, parent=parent)
++    thread.category = parent.category
++
++    keys = adapter._discord_channel_keys_from_channel(thread)
++
++    assert "501" in keys
++    assert "500" not in keys
 +
 +
 +@pytest.mark.asyncio
 +async def test_allowed_category_authorizes_child_channel_slash_command(adapter, monkeypatch):
 +    """Slash commands inherit allowed_channels membership from their category."""
 +    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "500")
++    monkeypatch.setenv("DISCORD_ALLOW_ALL_USERS", "true")
 +    monkeypatch.delenv("DISCORD_IGNORED_CHANNELS", raising=False)
 +    monkeypatch.delenv("CHATBIRD_ADMIN_USERS", raising=False)
 +    monkeypatch.delenv("CHATBIRD_ADMIN_CHANNELS", raising=False)
 +
-+    category = SimpleNamespace(id=500)
-+    channel = FakeTextChannel(channel_id=501, category=category)
++    channel = FakeTextChannel(channel_id=501, category=SimpleNamespace(id=500))
 +    interaction = SimpleNamespace(
 +        channel_id=channel.id,
 +        channel=channel,

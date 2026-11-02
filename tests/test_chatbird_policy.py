@@ -1,8 +1,10 @@
+import contextvars
 import importlib.util
 import json
 import os
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -47,7 +49,8 @@ class ChatBirdPolicyTests(unittest.TestCase):
             clear=False,
         )
         self.env.start()
-        MODULE._CURRENT_USER_MESSAGE.set("")
+        MODULE._USER_MESSAGES.clear()
+        MODULE._remember_user_message(os.environ["HERMES_SESSION_KEY"], "")
 
     def tearDown(self):
         self.env.stop()
@@ -192,8 +195,55 @@ class ChatBirdPolicyTests(unittest.TestCase):
             other = MODULE._on_pre_llm_call(user_message="hello", platform="discord")
             self.assertNotIn("Prefers concise answers", other["context"])
 
+    def test_largest_prompt_stays_under_hermes_spill_threshold(self):
+        """Past 10,000 characters Hermes would spill the policy to a file unless configured off."""
+        MODULE._write_entries(
+            MODULE._profile_path("200", "1"), ["p" * 500] * 3, title="profile"
+        )
+        MODULE._write_entries(MODULE._admin_path("200"), ["a" * 500] * 9, title="admin")
+        with patch.dict(
+            os.environ,
+            {
+                "HERMES_SESSION_USER_ID": "1",
+                "HERMES_SESSION_CHAT_ID": "999",
+                "HERMES_SESSION_KEY": "agent:main:discord:group:999:guild-200",
+            },
+        ):
+            context = MODULE._on_pre_llm_call(user_message="hi", platform="discord")["context"]
+        self.assertLess(len(context), 15000)
+
+    def test_memory_command_is_seen_across_the_hook_worker(self):
+        """Hermes runs pre_llm_call on a worker thread with a copied context."""
+        worker = threading.Thread(
+            target=contextvars.copy_context().run,
+            args=(MODULE._on_pre_llm_call,),
+            kwargs={"user_message": "请记住我喜欢红色", "platform": "discord"},
+        )
+        worker.start()
+        worker.join()
+
+        result = self.call(action="profile_add", category="preference", content="喜欢红色")
+
+        self.assertFalse(result["success"])
+        self.assertIn("directly command", result["error"])
+
+    def test_memory_write_fails_closed_when_the_hook_did_not_run(self):
+        MODULE._USER_MESSAGES.clear()
+
+        result = self.call(action="profile_add", category="preference", content="喜欢红色")
+
+        self.assertFalse(result["success"])
+        self.assertIn("directly command", result["error"])
+
+    def test_memory_commands_do_not_leak_between_sessions(self):
+        MODULE._remember_user_message("agent:main:discord:group:555:guild-200", "请记住这个")
+
+        result = self.call(action="profile_add", category="preference", content="喜欢红色")
+
+        self.assertTrue(result["success"])
+
     def test_direct_user_memory_command_is_rejected(self):
-        MODULE._CURRENT_USER_MESSAGE.set("请记住我喜欢红色")
+        MODULE._remember_user_message(os.environ["HERMES_SESSION_KEY"], "请记住我喜欢红色")
         result = self.call(
             action="profile_add",
             category="preference",
@@ -326,6 +376,13 @@ class ChatBirdPolicyTests(unittest.TestCase):
     def test_gateway_allows_cron_session_without_identity(self):
         with self._without_identity(_HERMES_GATEWAY="1"):
             self.assertIsNone(MODULE._on_pre_tool_call("terminal", session_id="cron_job1_20261101_100000"))
+
+    def test_gateway_allows_the_schedulers_own_cron_flag(self):
+        """An owner-run cron job has an ordinary session ID, so the scheduler's flag has to count."""
+        with patch.dict(os.environ, {"_HERMES_GATEWAY": "1", "HERMES_SESSION_PLATFORM": "", "HERMES_CRON_SESSION": "1"}):
+            self.assertIsNone(MODULE._on_pre_tool_call("terminal", session_id="20261102_100000_abcd"))
+        with patch.dict(os.environ, {"_HERMES_GATEWAY": "1", "HERMES_SESSION_PLATFORM": "", "HERMES_CRON_SESSION": ""}):
+            self.assertEqual(MODULE._on_pre_tool_call("terminal", session_id="20261102_100000_abcd")["action"], "block")
 
     def test_cron_session_id_does_not_rescue_a_public_turn(self):
         with patch.dict(os.environ, {"_HERMES_GATEWAY": "1"}):

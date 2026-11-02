@@ -48,9 +48,11 @@ safe tool surface as every other participant.
 Inside the gateway, a tool call without a Discord identity is denied. A worker
 thread that lost its ContextVars reads exactly like the local CLI, so the
 `_HERMES_GATEWAY` process marker decides, not the identity. Cron is the one
-exception: the scheduler binds an empty platform and its `cron_` session IDs are
-not user input. As a result, `delegate_task` batch children have no tools. The
-local CLI keeps normal access.
+exception: the scheduler binds an empty platform and a cron session flag, and
+neither that flag nor its `cron_` session IDs are user input. `delegate_task`
+batch children run in a copy of the turn's context, so they keep its identity:
+public turns cannot delegate at all, and an administrator's children are
+administrator calls. The local CLI keeps normal access.
 
 `session_search` is denied in every Discord and cron context, including the
 administrator channel, because it reads every Guild's transcripts.
@@ -68,7 +70,9 @@ files still match the approved SHA-256 digest. Public reads are inert: no
 template expansion, inline command execution, credential setup, or host-path
 disclosure is allowed. Production uses DDGS for no-key `web_search` and the
 request-driven `simple-http` provider for static HTML/text/JSON/XML extraction.
-Every other
+The anonymous Exa, Parallel, Firecrawl and Keenable tiers that Hermes would
+otherwise fall back to are turned off, so a failed call never sends a query or URL
+to them. Every other
 tool is denied at the pre-execution hook, including terminal, host-file access,
 local code execution, built-in memory, session search, Cron, Skill management,
 delegation, messaging, computer use, and Kanban tools. Discord slash commands
@@ -77,7 +81,10 @@ use a separate fail-closed gate. `/help`, `/whoami`, `/status`, `/version`, and
 plugin, or newly discovered slash command is administrator-only and requires
 the same administrator user ID plus the current Guild's administrator channel.
 DM slash commands are rejected, and `/skill` autocomplete returns no catalog
-entries to ordinary users.
+entries to ordinary users. A typed command such as `@bot /restart` passes the same
+gate, because it reaches the same dispatch; a denied one stays plain chat.
+`/memory` is refused in every Guild because its pending queue is not limited to one
+Guild, and `memory.write_approval` must stay off.
 
 Hermes normally asks the model to load a relevant Skill before using even a
 basic tool. Public ChatBird turns receive a filtered index, so the model may
@@ -155,7 +162,8 @@ file from elsewhere must copy it into `~/.hermes/cache/documents/` first.
 
 Hermes reloads `.env` with override on every turn but re-bridges only `max_turns`.
 A `HERMES_MEDIA_*` line in `.env` would therefore silently override these settings
-after the first turn, so `.env` must not contain any.
+after the first turn, so `.env` must not contain any. The startup config guard
+refuses to start if one appears.
 
 ## Layered Memory
 
@@ -164,6 +172,9 @@ after the first turn, so `.env` must not contain any.
 | Guild public memory | `memories/scopes/discord-guild-<guild_id>/MEMORY.md` | Everyone in that Guild; writes require an admin context |
 | User profile | `memories/chatbird/profiles/discord-guild-<guild_id>/<user_id>.md` | Injected only for that user; an admin can inspect it |
 | Admin memory | `memories/chatbird/admin/discord-guild-<guild_id>/ADMIN.md` | Injected and writable only in an admin context |
+
+A cron job created in Discord uses the memory of the Guild it came from, so jobs
+from two Guilds never share a store.
 
 The shared Hermes `USER.md` remains disabled. Its
 `memory.user_profile_enabled` setting is not the ChatBird profile switch and

@@ -15,7 +15,7 @@ import threading
 import urllib.error
 import urllib.parse
 import urllib.request
-from contextvars import ContextVar
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -25,9 +25,11 @@ except ImportError:  # pragma: no cover - Windows development only
     fcntl = None
 
 
-_CURRENT_USER_MESSAGE: ContextVar[str] = ContextVar(
-    "CHATBIRD_CURRENT_USER_MESSAGE", default=""
-)
+# pre_llm_call runs on a timeout worker with a copied context, so a ContextVar set there
+# never reaches the tool handler. The latest user message is kept per session key instead.
+_USER_MESSAGES: OrderedDict[str, str] = OrderedDict()
+_USER_MESSAGES_LOCK = threading.Lock()
+_USER_MESSAGES_MAX = 256
 _MEMORY_LOCK = threading.RLock()
 
 _PUBLIC_TOOLS = frozenset(
@@ -88,12 +90,14 @@ bounded public-index fallback; do not probe blocked statistics/API routes. For
 Vicious Syndicate, use web_search to locate a clean www.vicioussyndicate.com
 article URL and then call web_extract on that URL so the allowlisted reader
 fallback can run. Do not infer HSReplay data availability merely from the
-presence of a browser; verify useful page content through the canonical path."""
+presence of a browser; verify useful page content through the canonical path.
+When web_extract truncates a long page, ask for more with a larger char_limit;
+do not try to read its saved copy from disk."""
 
 _CRON_SESSION_PREFIX = "cron_"
 
 _DISCORD_API = "https://discord.com/api/v10"
-_DISCORD_USER_AGENT = "DiscordBot (https://github.com/MrZoyo/ChatBird, 1.5.0)"
+_DISCORD_USER_AGENT = "DiscordBot (https://github.com/MrZoyo/ChatBird, 1.6.0)"
 _DISCORD_TIMEOUT_SECONDS = 10
 _HISTORY_DEFAULT_MESSAGES = 100
 _HISTORY_MAX_MESSAGES = 200
@@ -384,6 +388,14 @@ def _profile_content(category: str, content: Any) -> tuple[str, str | None]:
     return f"[{category}] {value}", None
 
 
+def _remember_user_message(session_key: str, message: str) -> None:
+    with _USER_MESSAGES_LOCK:
+        _USER_MESSAGES[session_key] = message
+        _USER_MESSAGES.move_to_end(session_key)
+        while len(_USER_MESSAGES) > _USER_MESSAGES_MAX:
+            _USER_MESSAGES.popitem(last=False)
+
+
 def _handle_memory(params: dict[str, Any], **_: Any) -> str:
     ctx = _context()
     if ctx["platform"] != "discord" or not ctx["guild_id"] or not ctx["user_id"]:
@@ -428,7 +440,11 @@ def _handle_memory(params: dict[str, Any], **_: Any) -> str:
 
     stem = action.removeprefix("profile_")
     if not is_admin and stem in {"add", "replace", "remove"}:
-        if _MEMORY_DIRECTIVE_RE.search(_CURRENT_USER_MESSAGE.get("")):
+        with _USER_MESSAGES_LOCK:
+            message = _USER_MESSAGES.get(ctx["session_key"])
+        # A missing entry means the hook did not run for this turn, so the request
+        # cannot be shown to be autonomous.
+        if message is None or _MEMORY_DIRECTIVE_RE.search(message):
             return json.dumps(
                 {
                     "success": False,
@@ -706,8 +722,8 @@ def _memory_context(path: Path, heading: str, *, max_chars: int) -> str:
 def _on_pre_llm_call(user_message: str = "", platform: str = "", **_: Any) -> dict[str, str] | None:
     if str(platform or "").lower() != "discord":
         return None
-    _CURRENT_USER_MESSAGE.set(str(user_message or ""))
     ctx = _context()
+    _remember_user_message(ctx["session_key"], str(user_message or ""))
     if not ctx["guild_id"] or not ctx["user_id"]:
         return None
 
@@ -844,9 +860,12 @@ def _on_pre_tool_call(
         }
     if not _in_gateway_process():
         return None
-    # Inside the gateway only cron may run without a Discord identity: the
-    # scheduler binds an empty platform and these session IDs are not user input.
-    if ctx["platform"] == "" and str(session_id or "").startswith(_CRON_SESSION_PREFIX):
+    # Inside the gateway only cron may run without a Discord identity: the scheduler binds
+    # an empty platform and a cron flag, and neither these nor its session IDs are user input.
+    if ctx["platform"] == "" and (
+        str(session_id or "").startswith(_CRON_SESSION_PREFIX)
+        or _session_value("HERMES_CRON_SESSION") == "1"
+    ):
         return None
     return {
         "action": "block",

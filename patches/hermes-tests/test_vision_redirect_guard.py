@@ -1,4 +1,4 @@
-"""A public image URL must not be able to redirect the download to an internal address."""
+"""A public image URL must not reach an internal address, by redirect or by DNS rebinding."""
 
 import asyncio
 import threading
@@ -40,6 +40,8 @@ def server(monkeypatch):
         return "/internal" not in url
 
     monkeypatch.setattr(tools.url_safety, "async_is_safe_url", treat_internal_path_as_private)
+    # The connect-time guard would refuse this loopback server before any redirect is seen.
+    monkeypatch.setattr(tools.url_safety, "_global_allow_private_urls", lambda: True)
     monkeypatch.setenv("NO_PROXY", "*")
     yield f"http://127.0.0.1:{httpd.server_port}", hits
     httpd.shutdown()
@@ -59,3 +61,15 @@ def test_redirect_to_public_address_still_works(server, tmp_path):
     asyncio.run(_download_image(f"{base}/redirect/picture.png", tmp_path / "x", max_retries=1))
     assert hits == ["/redirect/picture.png", "/picture.png"]
     assert (tmp_path / "x").read_bytes() == b"image-bytes"
+
+
+def test_private_address_at_connect_time_is_refused(server, tmp_path, monkeypatch):
+    """Preflight can pass and DNS can then answer with an internal address (upstream 42626da1ce)."""
+    base, hits = server
+    monkeypatch.setattr(tools.url_safety, "_global_allow_private_urls", lambda: False)
+
+    with pytest.raises(Exception, match="during connect"):
+        asyncio.run(_download_image(f"{base}/picture.png", tmp_path / "x", max_retries=1))
+
+    assert hits == []
+    assert not (tmp_path / "x").exists()

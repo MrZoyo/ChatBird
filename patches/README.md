@@ -37,7 +37,9 @@ text channel must not invent thread-only `parent` fields, because that hides
 category lookup regressions and can make a correctly mentioned bot appear
 silent in a category-allowed channel.
 
-The public-skill/web-extract patch adds two ChatBird security boundaries:
+The public-skill/web-extract patch adds two ChatBird security boundaries, and
+carries the one prompt sentence that lets a trusted turn policy filter the skill
+index. The review and publication logic lives in `tools/public_skill_review.py`:
 
 - Public Discord skill discovery and reads are limited to externally recorded,
   SHA-256-bound approvals. Public reads are inert: they do not preprocess skill
@@ -46,9 +48,10 @@ The public-skill/web-extract patch adds two ChatBird security boundaries:
   separate tool-free agent approval. Rejection, malformed output, timeout, or
   policy failure preserves the previously approved version.
 
-It also separates web search and extraction availability and provides the
-no-key `simple-http` static HTML/text extractor with redirect, DNS, private
-network, response-size, and decompression guards.
+It also provides the no-key `simple-http` static HTML/text extractor with
+redirect, DNS, private network, response-size, and decompression guards. The
+extractor counts as available only when selected by name, so it never wins
+Hermes's autodetect walk.
 
 The browser-fallback patch keeps the public API limited to `web_search` and
 `web_extract` while optionally retrying failed searches, HTTP 403/5xx/timeouts,
@@ -82,27 +85,31 @@ Help Center (`support.discord.com`) answers article pages with a Cloudflare
 challenge for every non-browser client. Its robots rules allow article pages
 and the article API, and disallow only the view-statistics endpoint.
 
-The Anthropic user-key patch classifies `sk-ant-usr-*` API keys like Console
-`sk-ant-api*` keys: they authenticate with `x-api-key` and never receive the
-Claude Code OAuth identity transforms (system-prompt prefix, product-name
-rewrites, `mcp__` tool renames, CLI user agent). Upstream Hermes still treats
-every other `sk-ant-*` prefix as an OAuth token as of 2026-10-09.
+Typed commands such as `@bot /restart` reach the same gateway dispatch as native
+slash commands, so the slash-policy patch gates both with one function. A denied
+typed command stays plain chat: the event loses `allow_gateway_control`, nothing
+is dispatched, and tools remain gated per call.
 
-The vision redirect patch backports upstream `500c2b1e46`. The old SSRF guards
-tested `response.next_request`, which httpx leaves unset inside response hooks,
-so a public URL could redirect a `vision_analyze` download to an internal
-address. The guards now read the `Location` header. Drop this patch when the
-base commit moves past that upstream fix.
+Hermes v0.22.5 already has what two earlier patches carried. It classifies
+`sk-ant-usr-*` as an API key, and its image download guards read the `Location`
+header and pin DNS at connect time. `test_chatbird_provider_e2e.py` and
+`test_vision_redirect_guard.py` keep both behaviors under test.
+
+`test_chatbird_upgrade_contract.py` exercises what `chatbird-policy` and production
+rely on in Hermes itself: the gateway marker, cron binding, hook payloads, strict
+file delivery, the tool surface, and how the production config reaches the gates.
+Run it first after any upgrade. Set `CHATBIRD_PLUGIN_DIR` to the plugin.
 
 `hermes-gateway-browser.conf` is the tracked systemd drop-in for the stable
 local Chromium launcher. Install it under
 `/etc/systemd/system/hermes-gateway.service.d/`, then reload systemd. Keep the
 launcher pointed at the tested Chromium version after browser upgrades.
 
-The production checkout remains a normal Hermes Git worktree. When upgrading
-Hermes, update the base commit, refresh patches as needed, rebuild in a
-temporary worktree, run the targeted tests, and compare the rebuilt files with
-the intended production files before deployment.
+When upgrading Hermes, update the base commit, refresh patches as needed, rebuild
+in a temporary worktree, and run the targeted tests. Package the result with
+`scripts/build-hermes-release.sh` and deploy it next to the running version, so
+that switching and rolling back only change a systemd drop-in. See
+`../docs/hermes-upgrade-0.22.5.md`.
 
 ChatBird uses `main` as its only long-lived integration branch. Once a feature
 branch is merged, keep the patch stack and documentation on `main` and delete

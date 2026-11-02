@@ -34,5 +34,21 @@ Application changes only that Hermes checkout. For Hermes integration tests,
 install the dependencies required by its own manifest and follow its test
 instructions; the standalone tests do not validate a live gateway or API.
 
+## Run Hermes tests on macOS
+
+Hermes v0.22.5 pins its dependencies only for Python 3.14. Build its environment
+from the patched checkout:
+
+```bash
+UV_PROJECT_ENVIRONMENT=/path/to/hermes-venv uv sync --locked --python 3.14 \
+  --no-install-project --extra discord --extra anthropic --extra ddgs --group dev --group test
+```
+
+Hermes's Anthropic path reads the macOS keychain, and a failing assertion can
+print the token it finds. Before running its tests, put an executable `security`
+stub that exits non-zero at the front of `PATH`, unset `ANTHROPIC_API_KEY`,
+`ANTHROPIC_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN`, and pipe the output through a
+filter that redacts `sk-ant-`. Set `CHATBIRD_PLUGIN_DIR` for the contract tests.
+
 The Linux systemd files and `/root/.hermes` paths describe remote deployment.
 They are not local Mac paths and should remain unchanged.

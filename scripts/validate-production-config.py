@@ -36,9 +36,13 @@ def _string_set(value: Any) -> set[str]:
     return set()
 
 
+def _mapping(data: dict[str, Any], key: str) -> dict[str, Any]:
+    value = data.get(key)
+    return value if isinstance(value, dict) else {}
+
+
 def validate_config(data: dict[str, Any]) -> None:
-    discord = data.get("discord")
-    discord = discord if isinstance(discord, dict) else {}
+    discord = _mapping(data, "discord")
     allowed_guilds = _string_set(discord.get("allowed_guilds"))
     if not allowed_guilds:
         raise ConfigError("discord.allowed_guilds must contain at least one guild ID")
@@ -47,18 +51,70 @@ def validate_config(data: dict[str, Any]) -> None:
     if any(not guild_id.isdigit() for guild_id in allowed_guilds):
         raise ConfigError("discord.allowed_guilds entries must be numeric Discord guild IDs")
 
-    plugins = data.get("plugins")
-    plugins = plugins if isinstance(plugins, dict) else {}
-    if "chatbird-policy" not in _string_set(plugins.get("enabled")):
+    if "chatbird-policy" not in _string_set(_mapping(data, "plugins").get("enabled")):
         raise ConfigError("plugins.enabled must include chatbird-policy")
 
-    memory = data.get("memory")
-    memory = memory if isinstance(memory, dict) else {}
+    memory = _mapping(data, "memory")
     if memory.get("user_profile_enabled") is not False:
         raise ConfigError(
             "memory.user_profile_enabled must be false; "
             "ChatBird profiles are provided by chatbird-policy"
         )
+    if memory.get("write_approval"):
+        raise ConfigError(
+            "memory.write_approval must stay off; its pending queue is not limited to one guild"
+        )
+
+    gateway = _mapping(data, "gateway")
+    if gateway.get("strict") is not True or gateway.get("trust_recent_files") is not False:
+        raise ConfigError(
+            "gateway.strict must be true and gateway.trust_recent_files false; "
+            "otherwise a MEDIA: line can upload sessions and memory"
+        )
+
+    web = _mapping(data, "web")
+    if web.get("keyless_fallback") is not False or web.get("keyless_rescue") is not False:
+        raise ConfigError(
+            "web.keyless_fallback and web.keyless_rescue must be false; "
+            "otherwise failed calls send user queries and URLs to anonymous third-party tiers"
+        )
+
+    tool_search = _mapping(_mapping(data, "tools"), "tool_search")
+    if tool_search.get("enabled") not in ("off", False):
+        raise ConfigError(
+            "tools.tool_search.enabled must be off; "
+            "the bridge hides chatbird_* tools from public turns"
+        )
+
+    if _mapping(data, "security").get("allow_lazy_installs") is not False:
+        raise ConfigError(
+            "security.allow_lazy_installs must be false; a public bot must not install packages at runtime"
+        )
+
+
+def validate_env_file(path: Path) -> None:
+    """Check setting names only, so an error can never carry a value.
+
+    Hermes reloads this file over config.yaml on every turn, and the admin mapping decides who
+    may run commands and privileged tools.
+    """
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise ConfigError(f"cannot read {path.name}: {exc}") from exc
+    names = {
+        line.strip().removeprefix("export ").split("=", 1)[0].strip()
+        for line in lines
+        if "=" in line and not line.lstrip().startswith("#")
+    }
+    for name in sorted(names):
+        if name.startswith("HERMES_MEDIA_"):
+            raise ConfigError(
+                f"{path.name} must not set {name}; Hermes reloads it each turn over gateway.strict"
+            )
+    for name in ("CHATBIRD_ADMIN_USERS", "CHATBIRD_ADMIN_CHANNELS"):
+        if name not in names:
+            raise ConfigError(f"{path.name} must set {name}")
 
 
 def repair_builtin_profile(path: Path) -> bool:
@@ -138,6 +194,7 @@ def main() -> int:
     try:
         repaired = repair_builtin_profile(args.config) if args.repair_profile else False
         validate_config(_load_config(args.config))
+        validate_env_file(args.config.parent / ".env")
     except ConfigError as exc:
         print(f"ChatBird config guard failed: {exc}", file=sys.stderr)
         return 1

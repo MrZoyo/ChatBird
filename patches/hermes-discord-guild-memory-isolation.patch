@@ -1,307 +1,381 @@
-From 49d2aa56fbb349b80ebfec9b03a2a23e55cb16eb Mon Sep 17 00:00:00 2001
-From: MrZoyo <zoyozhang@gmail.com>
-Date: Tue, 11 Aug 2026 22:02:26 +0800
-Subject: [PATCH] fix(discord): isolate guild sessions and memory
-
----
- agent/agent_init.py                           | 25 ++++-
- gateway/run.py                                |  2 +
- gateway/session.py                            |  7 ++
- plugins/memory/mem0/__init__.py               |  6 ++
- plugins/platforms/discord/adapter.py          | 60 +++++++++++-
- run_agent.py                                  |  2 +
- .../test_discord_guild_memory_isolation.py    | 97 +++++++++++++++++++
- .../test_mem0_guild_memory_isolation.py       | 35 +++++++
- tools/memory_tool.py                          | 50 +++++++---
- 9 files changed, 266 insertions(+), 18 deletions(-)
- create mode 100644 tests/gateway/test_discord_guild_memory_isolation.py
- create mode 100644 tests/plugins/test_mem0_guild_memory_isolation.py
-
 diff --git a/agent/agent_init.py b/agent/agent_init.py
-index f9d2d1e4..d1763384 100644
+index 59006475de..7c3a9d92a4 100644
 --- a/agent/agent_init.py
 +++ b/agent/agent_init.py
-@@ -221,6 +221,7 @@ def init_agent(
-     chat_name: str = None,
-     chat_type: str = None,
-     thread_id: str = None,
-+    guild_id: str = None,
-     gateway_session_key: str = None,
-     skip_context_files: bool = False,
-     load_soul_identity: bool = False,
-@@ -306,6 +307,15 @@ def init_agent(
-     agent._chat_name = chat_name
-     agent._chat_type = chat_type
-     agent._thread_id = thread_id
-+    agent._guild_id = guild_id
-+    agent._memory_namespace = None
-+    if platform == "discord":
-+        if guild_id:
-+            agent._memory_namespace = f"discord-guild-{guild_id}"
-+        elif user_id:
-+            # DMs have no guild boundary.  Keep each user's direct-message
-+            # memory separate from every guild and every other DM user.
-+            agent._memory_namespace = f"discord-dm-{user_id}"
-     agent._gateway_session_key = gateway_session_key  # Stable per-chat key (e.g. agent:main:telegram:dm:123)
-     # Pluggable print function — CLI replaces this with _cprint so that
-     # raw ANSI status lines are routed through prompt_toolkit's renderer
-@@ -1174,6 +1184,7 @@ def init_agent(
+@@ -1286,6 +1286,15 @@ def _memory_provider_init_kwargs(agent, platform) -> dict[str, Any]:
+         _val = getattr(agent, f"_{_ident}")
+         if _val:
+             kwargs[_ident] = _val
++    # An external provider's principal must stay inside the Discord guild, or the same user could
++    # recall memories written in another guild.
++    if _namespace := getattr(agent, "_memory_namespace", None):
++        kwargs["memory_namespace"] = _namespace
++        if agent._guild_id:
++            kwargs["guild_id"] = agent._guild_id
++        for _ident in ("user_id", "user_id_alt"):
++            if kwargs.get(_ident):
++                kwargs[_ident] = f"{_namespace}:{kwargs[_ident]}"
+     if agent.session_cwd:
+         kwargs["cwd"] = agent.session_cwd
+     # Profile identity for per-profile provider scoping
+@@ -1296,6 +1305,16 @@ def _memory_provider_init_kwargs(agent, platform) -> dict[str, Any]:
+     return kwargs
+ 
+ 
++def _discord_memory_namespace(platform: str | None, guild_id: str | None, user_id: str | None) -> str | None:
++    """Directory scope for a Discord agent's memory; None outside Discord. ``guild_id`` is passed only
++    for Discord sources. A DM has no guild, so it stays separate from every guild and every other user."""
++    if guild_id:
++        return f"discord-guild-{guild_id}"
++    if platform == "discord" and user_id:
++        return f"discord-dm-{user_id}"
++    return None
++
++
+ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
+     # Persistent memory (MEMORY.md + USER.md) — loaded from disk
+     agent._memory_store = None
+@@ -1331,12 +1350,16 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
+                 _agent_cfg
+             )
+             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
+-            if agent._memory_enabled or agent._user_profile_enabled:
++            # A Discord agent with no guild and no user has no scope to use, and the unscoped
++            # directory belongs to the CLI and cron. A review fork rebinds its parent's store.
++            if (agent._memory_enabled or agent._user_profile_enabled) and (
++                    platform != "discord" or agent._memory_namespace):
                  agent._memory_store = MemoryStore(
                      memory_char_limit=mem_config.get("memory_char_limit", 2200),
                      user_char_limit=mem_config.get("user_char_limit", 1375),
+                     memory_enabled=agent._memory_enabled,
+                     user_profile_enabled=agent._user_profile_enabled,
 +                    memory_namespace=agent._memory_namespace,
                  )
                  agent._memory_store.load_from_disk()
-         except Exception:
-@@ -1216,9 +1227,15 @@ def init_agent(
-                             pass
-                     # Thread gateway user identity for per-user memory scoping
-                     if agent._user_id:
--                        _init_kwargs["user_id"] = agent._user_id
-+                        _memory_user_id = agent._user_id
-+                        if agent._memory_namespace:
-+                            _memory_user_id = f"{agent._memory_namespace}:{_memory_user_id}"
-+                        _init_kwargs["user_id"] = _memory_user_id
-                     if agent._user_id_alt:
--                        _init_kwargs["user_id_alt"] = agent._user_id_alt
-+                        _memory_user_id_alt = agent._user_id_alt
-+                        if agent._memory_namespace:
-+                            _memory_user_id_alt = f"{agent._memory_namespace}:{_memory_user_id_alt}"
-+                        _init_kwargs["user_id_alt"] = _memory_user_id_alt
-                     if agent._user_name:
-                         _init_kwargs["user_name"] = agent._user_name
-                     if agent._chat_id:
-@@ -1229,6 +1246,10 @@ def init_agent(
-                         _init_kwargs["chat_type"] = agent._chat_type
-                     if agent._thread_id:
-                         _init_kwargs["thread_id"] = agent._thread_id
-+                    if agent._guild_id:
-+                        _init_kwargs["guild_id"] = agent._guild_id
-+                    if agent._memory_namespace:
-+                        _init_kwargs["memory_namespace"] = agent._memory_namespace
-                     # Thread gateway session key for stable per-chat Honcho session isolation
-                     if agent._gateway_session_key:
-                         _init_kwargs["gateway_session_key"] = agent._gateway_session_key
-diff --git a/gateway/run.py b/gateway/run.py
-index 77d0c5d0..9e84f47b 100644
---- a/gateway/run.py
-+++ b/gateway/run.py
-@@ -11901,6 +11901,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
-                     chat_name=source.chat_name,
-                     chat_type=source.chat_type,
-                     thread_id=source.thread_id,
-+                    guild_id=source.guild_id,
-                     session_db=self._session_db,
-                     fallback_model=self._fallback_model,
-                 )
-@@ -16266,6 +16267,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
-                     chat_name=source.chat_name,
-                     chat_type=source.chat_type,
-                     thread_id=source.thread_id,
-+                    guild_id=source.guild_id,
-                     gateway_session_key=session_key,
-                     session_db=self._session_db,
-                     fallback_model=self._fallback_model,
+ 
+@@ -2275,7 +2298,7 @@ def init_agent(
+     request_overrides: dict[str, Any] | None = None, prefill_messages: list[dict[str, Any]] | None = None,
+     platform: str | None = None, user_id: str | None = None, user_id_alt: str | None = None, user_name: str | None = None,
+     chat_id: str | None = None, chat_name: str | None = None, chat_type: str | None = None, thread_id: str | None = None,
+-    gateway_session_key: str | None = None, skip_context_files: bool = False,
++    guild_id: str | None = None, gateway_session_key: str | None = None, skip_context_files: bool = False,
+     load_soul_identity: bool = False, skip_memory: bool = False,
+     skip_background_review: bool = False, session_db=None, parent_session_id: str | None = None,
+     iteration_budget: IterationBudget = None, run_budget_seconds: Optional[float] = None,
+@@ -2300,6 +2323,8 @@ def init_agent(
+         setattr(agent, _name, _params[_name])
+     for _name in _GATEWAY_IDENTITY_PARAMS:
+         setattr(agent, f"_{_name}", _params[_name])
++    agent._guild_id = guild_id
++    agent._memory_namespace = _discord_memory_namespace(platform, guild_id, user_id)
+     agent.session_cwd = cwd or None
+     # Shared iteration budget: parent creates, children inherit.
+     agent.iteration_budget = iteration_budget or IterationBudget(max_iterations)
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index 6e711cff81..2b7a2d8e75 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -2497,6 +2497,15 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
+     return setup
+ 
+ 
++def _cron_memory_guild(job: dict) -> Optional[str]:
++    """Memory scope for a job created in Discord: its guild, so jobs from two guilds never share the
++    unscoped directory. An origin older than ``scope_id`` stays apart under its channel."""
++    origin = job.get("origin") or {}
++    if origin.get("platform") != "discord":
++        return None
++    return str(origin.get("scope_id") or origin.get("guild_id") or f"unknown-{origin.get('chat_id')}")
++
++
+ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup, *, workdir, session_id, session_db):
+     runtime = setup.runtime
+     pr = _cfg.get("provider_routing") or {}
+@@ -2527,6 +2536,7 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
+         skip_context_files=not bool(workdir),
+         load_soul_identity=True,
+         skip_memory=False,
++        guild_id=_cron_memory_guild(job),
+         skip_background_review=True,  # Cron has no human-in-the-loop need for skill/memory review forks (~30K tok/event)
+         platform="cron",
+         session_id=session_id,
+diff --git a/gateway/run_turn.py b/gateway/run_turn.py
+index 85adec0ee9..bf86001118 100644
+--- a/gateway/run_turn.py
++++ b/gateway/run_turn.py
+@@ -32,7 +32,7 @@ from gateway.response_filters import (
+ from gateway.warning_notifications import diagnostic_metadata, diagnostic_turn_muted, diagnostic_wake_muted
+ from gateway.session import (
+     SessionSource, _session_key_namespace, build_channel_continuity_note,
+-    build_session_context,
++    build_session_context, discord_guild_id,
+ )
+ from gateway.session_transcript import TranscriptReadError
+ from gateway.turn_context import TurnContext
+@@ -550,6 +550,7 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
+                     **{k: getattr(source, k) for k in (
+                         "user_id", "user_id_alt", "user_name", "chat_id", "chat_name", "chat_type", "thread_id",
+                     )},
++                    guild_id=discord_guild_id(source),
+                     session_db=getattr(self._session_db, "_db", self._session_db),
+                     # Reload from disk — do not reuse the startup snapshot.
+                     # See #60955.
+diff --git a/gateway/run_turn_hygiene.py b/gateway/run_turn_hygiene.py
+index 2d379a973c..7a35f17230 100644
+--- a/gateway/run_turn_hygiene.py
++++ b/gateway/run_turn_hygiene.py
+@@ -665,6 +665,7 @@ class GatewayTurnHygieneMixin:
+         """Build the detached hygiene ``AIAgent`` with the live session's system prompt. Returns
+         ``(agent, sync_session_db)``."""
+         from gateway.run import _GATEWAY_HYGIENE_PLATFORM, _seed_hygiene_system_prompt
++        from gateway.session import detached_agent_memory_kwargs
+         from run_agent import AIAgent
+         try:
+             _hyg_session_row = await self._session_db.get_session(session_entry.session_id)
+@@ -686,7 +687,8 @@ class GatewayTurnHygieneMixin:
+         )
+         _hyg_agent = AIAgent(
+             **_hyg_runtime, model=_hyg_model, max_iterations=4, quiet_mode=True,
+-            skip_memory=not _hyg_checkpoint_required, enabled_toolsets=["memory"],
++            **detached_agent_memory_kwargs(
++                session_entry.platform, session_entry.origin, load_provider=_hyg_checkpoint_required),
+             session_id=session_entry.session_id, session_db=_hyg_session_db,
+         )
+         _seed_hygiene_system_prompt(_hyg_agent, _hyg_session_row)
 diff --git a/gateway/session.py b/gateway/session.py
-index f79e371d..a7d26e60 100644
+index 4547888037..856dc30ea1 100644
 --- a/gateway/session.py
 +++ b/gateway/session.py
-@@ -711,6 +711,10 @@ def build_session_key(
+@@ -683,6 +683,24 @@ def _canonical_participant(source: SessionSource) -> Optional[str]:
+     return participant_id
  
-     Group/channel rules:
-       - chat_id identifies the parent group/channel.
-+      - Discord guild_id is appended as a tagged scope segment.  Keeping it at
-+        the end preserves the positional layout consumed by legacy parsers
-+        while making the server boundary explicit instead of relying only on
-+        Discord's globally unique channel IDs.
-       - user_id/user_id_alt isolates participants within that parent chat when available when
-         ``group_sessions_per_user`` is enabled.
-       - thread_id differentiates threads within that parent chat.  When
-@@ -776,6 +780,9 @@ def build_session_key(
-     if isolate_user and participant_id:
-         key_parts.append(str(participant_id))
  
-+    if source.platform == Platform.DISCORD and source.guild_id:
-+        key_parts.append(f"guild-{source.guild_id}")
++def discord_guild_id(source: Any) -> Optional[str]:
++    """The Discord guild a source belongs to, else None. The guild is the tenant boundary for sessions
++    and memory; ``scope_id`` also carries other platforms' workspaces, so the platform check matters."""
++    if getattr(source, "platform", None) != Platform.DISCORD:
++        return None
++    scope = getattr(source, "scope_id", None)
++    return str(scope) if scope else None
 +
-     return ":".join(key_parts)
++
++def detached_agent_memory_kwargs(platform: Any, source: Any, *, load_provider: bool) -> dict[str, Any]:
++    """Memory kwargs for a throwaway agent rewriting one session's transcript. A Discord session whose
++    guild is unknown gets no memory at all: the unscoped directory belongs to the CLI and cron."""
++    guild_id = discord_guild_id(source)
++    if platform == Platform.DISCORD and not guild_id:
++        return {"skip_memory": True, "enabled_toolsets": []}
++    return {"skip_memory": not load_provider, "enabled_toolsets": ["memory"], "guild_id": guild_id}
++
++
+ def build_session_key(
+     source: SessionSource, group_sessions_per_user: bool = True,
+     thread_sessions_per_user: bool = False, profile: Optional[str] = None,
+@@ -690,8 +708,8 @@ def build_session_key(
+     """Build a deterministic session key from a message source (single source of truth).
+ 
+     Layout: ``<ns>:<platform>:<chat_type>[:<slack scope_id>][:<chat_id>][:<thread_id>][:<user>]``.
+-    Slack ``scope_id`` precedes chat ids (Discord guild scope is deliberately NOT added, for key
+-    compatibility). DMs are isolated per chat_id, falling back to the sender id, then to one
++    Slack ``scope_id`` precedes chat ids. A Discord guild is a tagged ``guild-<id>`` segment at the very
++    end, so positional parsers still find the chat id and thread id. DMs are isolated per chat_id, falling back to the sender id, then to one
+     session per platform. Groups add the participant id only when ``group_sessions_per_user`` and
+     not in a thread (threads are shared unless ``thread_sessions_per_user``).
+     """
+@@ -724,6 +742,9 @@ def build_session_key(
+     user_part = [str(participant_id)] if isolate_user and participant_id else []
+     thread_part = [thread_id] if thread_id else []
+     parts += user_part + thread_part if is_dm else thread_part + user_part
++    guild_id = discord_guild_id(source)
++    if guild_id:
++        parts.append(f"guild-{guild_id}")
+     return ":".join(str(part) for part in parts)
  
  
-diff --git a/plugins/memory/mem0/__init__.py b/plugins/memory/mem0/__init__.py
-index eccf6ad5..b9e69cc7 100644
---- a/plugins/memory/mem0/__init__.py
-+++ b/plugins/memory/mem0/__init__.py
-@@ -323,6 +323,12 @@ class Mem0MemoryProvider(MemoryProvider):
-         if configured == _DEFAULT_USER_ID:
-             configured = None
-         self._user_id = configured or kwargs.get("user_id") or _DEFAULT_USER_ID
-+        memory_namespace = str(kwargs.get("memory_namespace") or "").strip()
-+        if memory_namespace and not self._user_id.startswith(f"{memory_namespace}:"):
-+            # An operator-configured canonical principal must still remain
-+            # inside the gateway tenant.  Otherwise the same Discord user can
-+            # recall memories written in another guild.
-+            self._user_id = f"{memory_namespace}:{self._user_id}"
-         self._agent_id = self._config.get("agent_id", "hermes")
-         self._channel = kwargs.get("platform") or "cli"
-         self._backend = self._create_backend()
+diff --git a/gateway/session_execution.py b/gateway/session_execution.py
+index 3277a93230..a45c599739 100644
+--- a/gateway/session_execution.py
++++ b/gateway/session_execution.py
+@@ -154,6 +154,7 @@ class GatewaySessionAgentMixin:
+         ctx = self._ctx
+         runner = self._runner
+         src = ctx.source
++        from gateway.session import discord_guild_id
+         from gateway.session_authorities import active_authority
+         from gateway.session_policy import policy_for_source
+         from gateway.session_worker_construct import session_prefill
+@@ -173,7 +174,7 @@ class GatewaySessionAgentMixin:
+             session_id=ctx.session_id, platform=platform_key,
+             user_id=src.user_id, user_id_alt=src.user_id_alt, user_name=src.user_name,
+             chat_id=src.chat_id, chat_name=src.chat_name, chat_type=src.chat_type, thread_id=src.thread_id,
+-            gateway_session_key=ctx.session_key,
++            guild_id=discord_guild_id(src), gateway_session_key=ctx.session_key,
+             session_db=getattr(runner._session_db, "_db", runner._session_db),
+             # Reload from disk — do not reuse the startup snapshot.
+             # See #60955.
+diff --git a/gateway/slash_commands.py b/gateway/slash_commands.py
+index a4f6feb393..a1e201f78e 100644
+--- a/gateway/slash_commands.py
++++ b/gateway/slash_commands.py
+@@ -906,9 +906,14 @@ class GatewaySlashCommandsMixin(
+     async def _handle_memory_command(self, event: MessageEvent) -> str:
+         """Handle /memory — review pending memory writes + toggle the approval gate. Entries are small
+         enough to review inline, so the full flow works on every platform."""
++        from gateway.session import discord_guild_id
+         from hermes_cli.write_approval_commands import handle_pending_subcommand
+         from tools import write_approval as wa
+         from tools.memory_tool import load_on_disk_store
++        # The pending queue and this on-disk store are shared by the whole profile, so from a guild
++        # they would show and apply writes staged in another guild.
++        if discord_guild_id(event.source):
++            return "The memory write-approval queue is not limited to one Discord guild, so /memory is disabled here."
+         # Apply approved writes against a fresh on-disk store (the gateway has no long-lived agent;
+         # the store persists to the same MEMORY/USER.md and honors the configured char limits).
+         out = handle_pending_subcommand(
+diff --git a/gateway/slash_commands_session.py b/gateway/slash_commands_session.py
+index 8dfb87502a..129fc1d3c6 100644
+--- a/gateway/slash_commands_session.py
++++ b/gateway/slash_commands_session.py
+@@ -736,7 +736,8 @@ class GatewaySessionCommandsMixin:
+         # the transport applies its default effort — a 400 on non-reasoning models.
+         runtime_kwargs["reasoning_config"] = self._resolve_session_reasoning_config(source=source, model=model)
+ 
+-        tmp_agent = await self._build_manual_compression_agent(session_entry.session_id, model, runtime_kwargs)
++        tmp_agent = await self._build_manual_compression_agent(
++            session_entry.session_id, model, runtime_kwargs, source=source)
+         try:
+             # Not a bare run_in_executor: the profile secret scope is a contextvar the default
+             # executor hop would drop, failing aux-client credential resolution closed.
+@@ -758,10 +759,11 @@ class GatewaySessionCommandsMixin:
+             await self._cleanup_agent_resources_off_loop(tmp_agent, context="manual compression")
+         return "\n".join(_manual_compression_reply_lines(summary, compressor, request.focus_topic))
+ 
+-    async def _build_manual_compression_agent(self, session_id: str, model, runtime_kwargs: dict):
++    async def _build_manual_compression_agent(self, session_id: str, model, runtime_kwargs: dict, source=None):
+         """Build the throwaway AIAgent that performs a manual /compress rewrite of *session_id*."""
+         from run_agent import AIAgent
+         from gateway.run import _GATEWAY_HYGIENE_PLATFORM, _seed_hygiene_system_prompt
++        from gateway.session import detached_agent_memory_kwargs
+         from hermes_cli.config import load_config as _load_cfg
+         from utils import is_truthy_value as _is_truthy
+ 
+@@ -784,7 +786,8 @@ class GatewaySessionCommandsMixin:
+             ((_load_cfg() or {}).get("compression") or {}).get("checkpoint_required"),
+             default=False)
+         tmp_agent = AIAgent(**runtime_kwargs, model=model, max_iterations=4, quiet_mode=True,
+-                            skip_memory=not _checkpoint_required, enabled_toolsets=["memory"],
++                            **detached_agent_memory_kwargs(
++                                getattr(source, "platform", None), source, load_provider=_checkpoint_required),
+                             session_id=session_id,
+                             session_db=getattr(self._session_db, "_db", self._session_db))
+         _seed_hygiene_system_prompt(tmp_agent, session_row)
 diff --git a/plugins/platforms/discord/adapter.py b/plugins/platforms/discord/adapter.py
-index d4ae5984..c9ee580f 100644
+index f5d39af68d..634d0b2b6c 100644
 --- a/plugins/platforms/discord/adapter.py
 +++ b/plugins/platforms/discord/adapter.py
-@@ -2855,6 +2855,23 @@ class DiscordAdapter(BasePlatformAdapter):
+@@ -602,6 +602,7 @@ _GATE_ENV_KEYS = (
+     "DISCORD_ALLOWED_USERS", "DISCORD_ALLOWED_ROLES", "DISCORD_ALLOWED_CHANNELS",
+     "DISCORD_IGNORED_CHANNELS", "DISCORD_NO_THREAD_CHANNELS", "DISCORD_FREE_RESPONSE_CHANNELS",
+     "DISCORD_MISSED_MESSAGE_BACKFILL_CHANNELS", "DISCORD_ALLOW_ALL_USERS", "DISCORD_ALLOW_BOTS",
++    "DISCORD_ALLOWED_GUILDS",
+     "GATEWAY_ALLOW_ALL_USERS", "GATEWAY_ALLOWED_USERS",
+ )
+ 
+@@ -1680,6 +1681,9 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
+             return False, False
+         if message.type not in {discord.MessageType.default, discord.MessageType.reply}:
+             return False, False
++        msg_guild = getattr(message, "guild", None)
++        if msg_guild is not None and self._discord_guild_denied(msg_guild):
++            return False, False
+         role_authorized = False
+         if getattr(message.author, "bot", False):
+             allow_bots = self._get_allow_bots()
+@@ -5010,6 +5014,16 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
+             return {str(part).strip() for part in raw if str(part).strip()}
+         return {part.strip() for part in str(raw).split(",") if part.strip()}
+ 
++    def _discord_allowed_guilds(self) -> set:
++        """This adapter's ``discord.allowed_guilds`` gate (per-profile)."""
++        return self._gate_csv_set(self._gate_raw("allowed_guilds", "DISCORD_ALLOWED_GUILDS"))
++
++    def _discord_guild_denied(self, guild: Any) -> bool:
++        """True when an allowlist is set and ``guild`` is not on it. A verified or public bot can be
++        invited to servers the operator never configured, and those must not reach the agent."""
++        allowed = self._discord_allowed_guilds()
++        return bool(allowed) and "*" not in allowed and str(getattr(guild, "id", "")) not in allowed
++
+     def _get_allowed_channels(self) -> set:
+         """This adapter's DISCORD_ALLOWED_CHANNELS gate (per-profile)."""
+         return self._gate_csv_set(self._gate_raw("allowed_channels", "DISCORD_ALLOWED_CHANNELS"))
+@@ -6087,6 +6101,10 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
+         self, message: DiscordMessage, role_authorized: bool = False, *, recovered: bool = False,
+     ) -> bool:
+         """Handle one Discord message and report whether it reached dispatch."""
++        message_guild = getattr(message, "guild", None)
++        if message_guild is not None and self._discord_guild_denied(message_guild):
++            logger.debug("[%s] Ignoring message from non-allowed guild: %s", self.name, message_guild.id)
++            return False
+         # Server channels (not DMs) require @mention unless free-response or an already-joined thread.
+         #
+         # Config (discord.* in config.yaml or DISCORD_* env vars):
+@@ -7334,6 +7352,7 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
+         seeded_extra["missed_message_backfill"] = dict(backfill_cfg)
+     _gate("ignored_channels", "DISCORD_IGNORED_CHANNELS", from_platform_extra=False)
+     _gate("allowed_channels", "DISCORD_ALLOWED_CHANNELS", from_platform_extra=False)
++    _gate("allowed_guilds", "DISCORD_ALLOWED_GUILDS", from_platform_extra=False)
+     _gate("no_thread_channels", "DISCORD_NO_THREAD_CHANNELS", from_platform_extra=False)
+     # history_backfill: recover mention-gated channel messages between bot turns.
+     if "history_backfill" in discord_cfg:
+diff --git a/plugins/platforms/discord/adapter_slash_auth.py b/plugins/platforms/discord/adapter_slash_auth.py
+index ebb80b5cde..b1513e7f6c 100644
+--- a/plugins/platforms/discord/adapter_slash_auth.py
++++ b/plugins/platforms/discord/adapter_slash_auth.py
+@@ -12,6 +12,7 @@ except ImportError:  # the adapter does not start without discord.py
+ class DiscordSlashAuthMixin:
+     _get_parent_channel_id: Callable[[Any], Optional[str]]
+     _discord_channel_keys_from_channel: Callable[..., set]
++    _discord_guild_denied: Callable[[Any], bool]
+     _get_allowed_channels: Callable[[], set]
+     _get_ignored_channels: Callable[[], set]
+     _is_allowed_user: Callable[..., bool]
+@@ -29,6 +30,9 @@ class DiscordSlashAuthMixin:
          """
          chan_obj = getattr(interaction, "channel", None)
          in_dm = isinstance(chan_obj, discord.DMChannel) if chan_obj is not None else False
-+        interaction_guild = getattr(interaction, "guild", None)
-+
-+        # ── Guild scope ──
-+        # A verified/public bot can be invited to servers the operator did not
-+        # configure.  When an allowlist is present, fail closed before channel,
-+        # role, or command checks so unknown guilds cannot use the agent.
-+        if not in_dm:
-+            allowed_guilds = self._discord_allowed_guilds()
-+            if allowed_guilds and "*" not in allowed_guilds:
-+                guild_id = getattr(interaction_guild, "id", None)
-+                if guild_id is None:
-+                    return (
-+                        False,
-+                        "guild id missing with discord.allowed_guilds configured",
-+                    )
-+                if str(guild_id) not in allowed_guilds:
-+                    return (False, "guild not in discord.allowed_guilds")
- 
-         # ── Channel scope (mirrors on_message lines 3374-3388) ──
-         # DMs aren't channel-gated — DMs follow on_message's DM lockdown
-@@ -2913,7 +2930,6 @@ class DiscordAdapter(BasePlatformAdapter):
-         # Pass guild + is_dm so role check is scoped to the originating
-         # guild and cross-guild DM bypass (#12136) can't land via the
-         # slash surface either.
--        interaction_guild = getattr(interaction, "guild", None)
-         if not self._is_allowed_user(
-             user_id,
-             author=user,
-@@ -4000,6 +4016,8 @@ class DiscordAdapter(BasePlatformAdapter):
-         is_dm = isinstance(interaction.channel, discord.DMChannel)
-         is_thread = isinstance(interaction.channel, discord.Thread)
-         thread_id = None
-+        interaction_guild = getattr(interaction, "guild", None)
-+        interaction_guild_id = getattr(interaction_guild, "id", None)
- 
-         if is_dm:
-             chat_type = "dm"
-@@ -4027,6 +4045,7 @@ class DiscordAdapter(BasePlatformAdapter):
-             user_name=interaction.user.display_name,
-             thread_id=thread_id,
-             chat_topic=chat_topic,
-+            guild_id=str(interaction_guild_id) if interaction_guild_id else None,
-         )
- 
-         msg_type = MessageType.COMMAND if text.startswith("/") else MessageType.TEXT
-@@ -4091,9 +4110,9 @@ class DiscordAdapter(BasePlatformAdapter):
-         text: str,
-     ) -> None:
-         """Build a MessageEvent pointing at a thread and send it through handle_message."""
--        guild_name = ""
--        if hasattr(interaction, "guild") and interaction.guild:
--            guild_name = interaction.guild.name
-+        interaction_guild = getattr(interaction, "guild", None)
-+        guild_name = getattr(interaction_guild, "name", "")
-+        interaction_guild_id = getattr(interaction_guild, "id", None)
- 
-         chat_name = f"{guild_name} / {thread_name}" if guild_name else thread_name
- 
-@@ -4109,6 +4128,7 @@ class DiscordAdapter(BasePlatformAdapter):
-             user_name=interaction.user.display_name,
-             thread_id=thread_id,
-             chat_topic=chat_topic,
-+            guild_id=str(interaction_guild_id) if interaction_guild_id else None,
-         )
- 
-         _parent_channel = self._thread_parent_channel(getattr(interaction, "channel", None))
-@@ -4151,6 +4171,17 @@ class DiscordAdapter(BasePlatformAdapter):
-             return bool(configured)
-         return os.getenv("DISCORD_REQUIRE_MENTION", "true").lower() not in {"false", "0", "no", "off"}
- 
-+    def _discord_allowed_guilds(self) -> set[str]:
-+        """Return guild IDs explicitly allowed to use this bot.
-+
-+        The public setting is ``discord.allowed_guilds`` in config.yaml.  The
-+        platform config bridge mirrors it to an internal environment value so
-+        the existing hot-reload and precedence behavior stays consistent with
-+        the other Discord allowlists.
-+        """
-+        raw = os.getenv("DISCORD_ALLOWED_GUILDS", "")
-+        return {part.strip() for part in raw.split(",") if part.strip()}
-+
-     def _discord_allow_any_attachment(self) -> bool:
-         """Return whether Discord attachments bypass the SUPPORTED_DOCUMENT_TYPES allowlist.
- 
-@@ -5175,6 +5206,21 @@ class DiscordAdapter(BasePlatformAdapter):
- 
-     async def _handle_message(self, message: DiscordMessage, role_authorized: bool = False) -> None:
-         """Handle incoming Discord messages."""
-+        message_guild = getattr(message, "guild", None)
-+        if message_guild is not None:
-+            allowed_guilds = self._discord_allowed_guilds()
-+            guild_id = str(getattr(message_guild, "id", ""))
-+            if (
-+                allowed_guilds
-+                and "*" not in allowed_guilds
-+                and guild_id not in allowed_guilds
-+            ):
-+                logger.debug(
-+                    "[%s] Ignoring message from non-allowed guild: %s",
-+                    self.name,
-+                    guild_id or "unknown",
-+                )
-+                return
-         # In server channels (not DMs), require the bot to be @mentioned
-         # UNLESS the channel is in the free-response list or the message is
-         # in a thread where the bot has already participated.
-@@ -7080,6 +7126,12 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
-         if isinstance(ac, list):
-             ac = ",".join(str(v) for v in ac)
-         os.environ["DISCORD_ALLOWED_CHANNELS"] = str(ac)
-+    # allowed_guilds: verified/public bots only operate in configured servers
-+    ag = discord_cfg.get("allowed_guilds")
-+    if ag is not None and not os.getenv("DISCORD_ALLOWED_GUILDS"):
-+        if isinstance(ag, list):
-+            ag = ",".join(str(v) for v in ag)
-+        os.environ["DISCORD_ALLOWED_GUILDS"] = str(ag)
-     # no_thread_channels: channels where bot responds directly without creating thread
-     ntc = discord_cfg.get("no_thread_channels")
-     if ntc is not None and not os.getenv("DISCORD_NO_THREAD_CHANNELS"):
++        # Fail closed before channel, role or command checks: an unknown guild cannot use the agent.
++        if not in_dm and self._discord_guild_denied(getattr(interaction, "guild", None)):
++            return (False, "guild not in discord.allowed_guilds")
+         channel_ids: set = set()
+         channel_keys: set = set()
+         # Channel scope mirrors on_message; DMs use on_message's DM lockdown path instead.
 diff --git a/run_agent.py b/run_agent.py
-index 3a3b6f4f..a6e89498 100644
+index eda287031f..63e2a96f04 100644
 --- a/run_agent.py
 +++ b/run_agent.py
-@@ -412,6 +412,7 @@ class AIAgent:
-         chat_name: str = None,
-         chat_type: str = None,
-         thread_id: str = None,
-+        guild_id: str = None,
-         gateway_session_key: str = None,
-         skip_context_files: bool = False,
-         load_soul_identity: bool = False,
-@@ -487,6 +488,7 @@ class AIAgent:
-             chat_name=chat_name,
-             chat_type=chat_type,
-             thread_id=thread_id,
-+            guild_id=guild_id,
-             gateway_session_key=gateway_session_key,
-             skip_context_files=skip_context_files,
-             load_soul_identity=load_soul_identity,
+@@ -266,7 +266,7 @@ class AIAgent(
+         request_overrides: dict[str, Any] | None = None, prefill_messages: list[dict[str, Any]] | None = None,
+         platform: str | None = None, user_id: str | None = None, user_id_alt: str | None = None, user_name: str | None = None,
+         chat_id: str | None = None, chat_name: str | None = None, chat_type: str | None = None, thread_id: str | None = None,
+-        gateway_session_key: str | None = None,
++        guild_id: str | None = None, gateway_session_key: str | None = None,
+         skip_context_files: bool = False, load_soul_identity: bool = False,
+         skip_memory: bool = False, skip_background_review: bool = False,
+         session_db=None, parent_session_id: str | None = None,
 diff --git a/tests/gateway/test_discord_guild_memory_isolation.py b/tests/gateway/test_discord_guild_memory_isolation.py
 new file mode 100644
-index 00000000..90346fd3
+index 0000000000..019d964c66
 --- /dev/null
 +++ b/tests/gateway/test_discord_guild_memory_isolation.py
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,226 @@
 +from types import SimpleNamespace
 +
++import pytest
++
 +from gateway.config import Platform
-+from gateway.session import SessionSource, build_session_key
-+from plugins.platforms.discord.adapter import DiscordAdapter
++from gateway.session import SessionSource, build_session_key, detached_agent_memory_kwargs, discord_guild_id
++from plugins.platforms.discord.adapter import DiscordAdapter, _apply_yaml_config
++from run_agent import AIAgent
 +from tools.memory_tool import MemoryStore, get_memory_dir
 +
 +
@@ -323,6 +397,25 @@ index 00000000..90346fd3
 +    assert first.split(":")[4] == "123456789"
 +    assert first.endswith(":guild-100")
 +    assert second.endswith(":guild-200")
++
++
++def test_discord_thread_key_keeps_thread_position_and_guild():
++    source = SessionSource(
++        platform=Platform.DISCORD, chat_id="55", chat_type="thread",
++        user_id="42", thread_id="55", guild_id="100",
++    )
++
++    parts = build_session_key(source).split(":")
++
++    assert parts[3:6] == ["thread", "55", "55"]
++    assert parts[-1] == "guild-100"
++
++
++def test_guild_suffix_is_discord_only():
++    source = SessionSource(platform=Platform.TELEGRAM, chat_id="1", chat_type="group", scope_id="100")
++
++    assert discord_guild_id(source) is None
++    assert "guild-" not in build_session_key(source)
 +
 +
 +def test_discord_guild_memory_directories_do_not_share_entries(monkeypatch, tmp_path):
@@ -347,17 +440,102 @@ index 00000000..90346fd3
 +    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
 +
 +    assert get_memory_dir() == tmp_path / ".hermes" / "memories"
++    assert MemoryStore()._path_for("memory") == tmp_path / ".hermes" / "memories" / "MEMORY.md"
 +
 +
-+def test_memory_namespace_rejects_path_traversal(monkeypatch, tmp_path):
++@pytest.mark.parametrize("namespace", ["../another-guild", "a/b", "..", "with space", "guild\n1"])
++def test_memory_namespace_rejects_unsafe_values(monkeypatch, tmp_path, namespace):
 +    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
 +
-+    try:
-+        get_memory_dir("../another-guild")
-+    except ValueError:
-+        pass
-+    else:
-+        raise AssertionError("path-traversing memory namespace was accepted")
++    with pytest.raises(ValueError):
++        MemoryStore(memory_namespace=namespace)
++
++
++@pytest.mark.parametrize(
++    "kwargs, expected",
++    [
++        ({"platform": "discord", "guild_id": "100", "user_id": "42"}, "discord-guild-100"),
++        ({"platform": "discord", "user_id": "42"}, "discord-dm-42"),
++        ({"guild_id": "100"}, "discord-guild-100"),
++        ({"platform": "telegram", "user_id": "42"}, None),
++    ],
++)
++def test_agent_scopes_memory_to_the_discord_guild(monkeypatch, tmp_path, kwargs, expected):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    (home / "config.yaml").write_text("memory:\n  memory_enabled: true\n", encoding="utf-8")
++
++    agent = AIAgent(
++        model="test/model", api_key="k", base_url="http://127.0.0.1:9/v1", quiet_mode=True,
++        enabled_toolsets=["memory"], skip_context_files=True, **kwargs,
++    )
++
++    assert agent._memory_namespace == expected
++    assert agent._memory_store.memory_namespace == expected
++    agent.close()
++
++
++def test_external_memory_principal_stays_inside_the_guild():
++    from agent.agent_init import _memory_provider_init_kwargs
++
++    agent = SimpleNamespace(
++        session_id="s", _session_db=None, session_cwd=None, _memory_namespace="discord-guild-100",
++        _user_id="42", _user_id_alt="alt", _user_name=None, _chat_id="7", _chat_name=None,
++        _chat_type=None, _thread_id=None, _guild_id="100", _gateway_session_key=None,
++    )
++
++    kwargs = _memory_provider_init_kwargs(agent, "discord")
++
++    assert kwargs["user_id"] == "discord-guild-100:42"
++    assert kwargs["user_id_alt"] == "discord-guild-100:alt"
++    assert kwargs["guild_id"] == "100"
++    assert kwargs["memory_namespace"] == "discord-guild-100"
++
++
++def test_unscoped_discord_agent_gets_no_memory_store(monkeypatch, tmp_path):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    (home / "config.yaml").write_text("memory:\n  memory_enabled: true\n", encoding="utf-8")
++
++    agent = AIAgent(
++        model="test/model", api_key="k", base_url="http://127.0.0.1:9/v1", quiet_mode=True,
++        enabled_toolsets=["memory"], skip_context_files=True, platform="discord",
++    )
++
++    assert agent._memory_store is None
++    agent.close()
++
++
++def test_transcript_rewriters_never_fall_back_to_the_unscoped_directory():
++    scoped = _discord_source("100")
++    assert detached_agent_memory_kwargs(Platform.DISCORD, scoped, load_provider=False) == {
++        "skip_memory": True, "enabled_toolsets": ["memory"], "guild_id": "100",
++    }
++    for origin in (None, SessionSource(platform=Platform.DISCORD, chat_id="1", chat_type="dm", user_id="42")):
++        assert detached_agent_memory_kwargs(Platform.DISCORD, origin, load_provider=True) == {
++            "skip_memory": True, "enabled_toolsets": [],
++        }
++    assert detached_agent_memory_kwargs(Platform.TELEGRAM, None, load_provider=True) == {
++        "skip_memory": False, "enabled_toolsets": ["memory"], "guild_id": None,
++    }
++
++
++@pytest.mark.parametrize(
++    "origin, expected",
++    [
++        ({"platform": "discord", "chat_id": "7", "scope_id": "100"}, "100"),
++        ({"platform": "discord", "chat_id": "7", "guild_id": "100"}, "100"),
++        ({"platform": "discord", "chat_id": "7"}, "unknown-7"),
++        ({"platform": "telegram", "chat_id": "7", "scope_id": "100"}, None),
++        (None, None),
++    ],
++)
++def test_cron_job_memory_stays_inside_the_guild_that_created_it(origin, expected):
++    from cron.scheduler import _cron_memory_guild
++
++    assert _cron_memory_guild({"origin": origin}) == expected
 +
 +
 +def _authorization_adapter() -> DiscordAdapter:
@@ -373,15 +551,18 @@ index 00000000..90346fd3
 +        channel=SimpleNamespace(id=10),
 +        channel_id=10,
 +        guild=SimpleNamespace(id=int(guild_id)),
++        guild_id=int(guild_id),
 +        user=SimpleNamespace(id=42),
 +    )
 +
 +
 +def test_allowed_guild_can_use_slash_commands(monkeypatch):
 +    monkeypatch.setenv("DISCORD_ALLOWED_GUILDS", "100")
++    monkeypatch.delenv("CHATBIRD_ADMIN_USERS", raising=False)
++    monkeypatch.delenv("CHATBIRD_ADMIN_CHANNELS", raising=False)
 +
 +    assert _authorization_adapter()._evaluate_slash_authorization(
-+        _guild_interaction("100")
++        _guild_interaction("100"), "/status",
 +    ) == (True, None)
 +
 +
@@ -394,141 +575,82 @@ index 00000000..90346fd3
 +
 +    assert allowed is False
 +    assert reason == "guild not in discord.allowed_guilds"
-diff --git a/tests/plugins/test_mem0_guild_memory_isolation.py b/tests/plugins/test_mem0_guild_memory_isolation.py
-new file mode 100644
-index 00000000..7cd4c1a9
---- /dev/null
-+++ b/tests/plugins/test_mem0_guild_memory_isolation.py
-@@ -0,0 +1,35 @@
-+import plugins.memory.mem0 as mem0_module
 +
 +
-+def test_configured_mem0_principal_is_scoped_to_discord_guild(monkeypatch):
-+    provider = mem0_module.Mem0MemoryProvider()
-+    monkeypatch.setattr(
-+        mem0_module,
-+        "_load_config",
-+        lambda: {"mode": "platform", "user_id": "canonical-user"},
-+    )
-+    monkeypatch.setattr(provider, "_create_backend", lambda: None)
++def test_missing_guild_is_denied_when_an_allowlist_exists(monkeypatch):
++    monkeypatch.setenv("DISCORD_ALLOWED_GUILDS", "100")
++    interaction = _guild_interaction("100")
++    interaction.guild = None
 +
-+    provider.initialize(
-+        "session-1",
-+        platform="discord",
-+        user_id="42",
-+        memory_namespace="discord-guild-100",
-+    )
++    allowed, reason = _authorization_adapter()._evaluate_slash_authorization(interaction)
 +
-+    assert provider._user_id == "discord-guild-100:canonical-user"
++    assert allowed is False
++    assert reason == "guild not in discord.allowed_guilds"
 +
 +
-+def test_mem0_principal_is_not_double_scoped(monkeypatch):
-+    provider = mem0_module.Mem0MemoryProvider()
-+    monkeypatch.setattr(mem0_module, "_load_config", lambda: {"mode": "platform"})
-+    monkeypatch.setattr(provider, "_create_backend", lambda: None)
++def test_yaml_allowed_guilds_reach_the_gate(monkeypatch):
++    monkeypatch.delenv("DISCORD_ALLOWED_GUILDS", raising=False)
 +
-+    provider.initialize(
-+        "session-1",
-+        platform="discord",
-+        user_id="discord-guild-100:42",
-+        memory_namespace="discord-guild-100",
-+    )
++    _apply_yaml_config({}, {"allowed_guilds": ["100", 200]})
 +
-+    assert provider._user_id == "discord-guild-100:42"
++    assert _authorization_adapter()._discord_allowed_guilds() == {"100", "200"}
 diff --git a/tools/memory_tool.py b/tools/memory_tool.py
-index 96a8a1a0..edeb13d2 100644
+index aeb839a2e6..ab0e1405c9 100644
 --- a/tools/memory_tool.py
 +++ b/tools/memory_tool.py
-@@ -52,9 +52,25 @@ logger = logging.getLogger(__name__)
- # (HERMES_HOME env var changes) are always respected.  The old module-level
- # constant was cached at import time and could go stale if a profile switch
- # happened after the first import.
+@@ -35,9 +35,18 @@ logger = logging.getLogger(__name__)
+ _memory_surface_flags: ContextVar[Optional[tuple[bool, bool]]] = ContextVar("memory_surface_flags", default=None)
+ 
+ 
 -def get_memory_dir() -> Path:
--    """Return the profile-scoped memories directory."""
+-    """Profile-scoped memories dir, resolved per call (HERMES_HOME may switch after import)."""
 -    return get_hermes_home() / "memories"
 +def get_memory_dir(namespace: Optional[str] = None) -> Path:
-+    """Return the profile- and tenant-scoped memories directory.
-+
-+    The legacy unscoped location remains unchanged for CLI and non-tenant
-+    callers.  Gateway adapters can provide a conservative identifier such as
-+    ``discord-guild-123`` so persistent memory never crosses tenant borders.
-+    """
++    """Profile-scoped memories dir, resolved per call (HERMES_HOME may switch after import).
++    A namespace such as ``discord-guild-123`` selects a separate tenant directory; the unscoped
++    location stays the CLI's."""
 +    base = get_hermes_home() / "memories"
 +    if not namespace:
 +        return base
 +    value = str(namespace).strip()
-+    safe_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
-+    if (
-+        not value
-+        or len(value) > 160
-+        or any(ch not in safe_chars for ch in value)
-+    ):
++    if not value or len(value) > 160 or not value.isascii() or any(not (ch.isalnum() or ch in "._-") for ch in value) \
++            or set(value) == {"."}:
 +        raise ValueError("memory namespace must contain only letters, numbers, '.', '_' or '-'")
 +    return base / "scopes" / value
  
- ENTRY_DELIMITER = "\n§\n"
  
-@@ -121,11 +137,25 @@ class MemoryStore:
-         Tool responses always reflect this live state.
-     """
+ from tools.memory_tool_store import (
+diff --git a/tools/memory_tool_store.py b/tools/memory_tool_store.py
+index 3666bf9fd5..eb6aed5894 100644
+--- a/tools/memory_tool_store.py
++++ b/tools/memory_tool_store.py
+@@ -184,7 +184,12 @@ class MemoryStore:
+     _MAX_CONSOLIDATION_FAILURES_PER_TURN = 3
  
--    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
-+    def __init__(
-+        self,
-+        memory_char_limit: int = 2200,
-+        user_char_limit: int = 1375,
-+        memory_namespace: Optional[str] = None,
-+    ):
-         self.memory_entries: List[str] = []
-         self.user_entries: List[str] = []
-         self.memory_char_limit = memory_char_limit
-         self.user_char_limit = user_char_limit
+     def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375, *,
+-                 memory_enabled: bool = True, user_profile_enabled: bool = True):
++                 memory_enabled: bool = True, user_profile_enabled: bool = True,
++                 memory_namespace: Optional[str] = None):
 +        self.memory_namespace = memory_namespace
-+        # Preserve the legacy zero-argument call for unscoped stores.  Besides
-+        # keeping the public helper compatible, several integrations replace
-+        # get_memory_dir with a zero-argument path resolver.
-+        self._memory_dir = (
-+            get_memory_dir(memory_namespace)
-+            if memory_namespace
-+            else get_memory_dir()
-+        )
-         # Frozen snapshot for system prompt -- set once at load_from_disk()
-         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
- 
-@@ -146,7 +176,7 @@ class MemoryStore:
-         Scanning is deterministic from disk bytes, so the snapshot remains
-         stable for the entire session (prefix-cache invariant holds).
-         """
--        mem_dir = get_memory_dir()
-+        mem_dir = self._memory_dir
-         mem_dir.mkdir(parents=True, exist_ok=True)
- 
-         self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
-@@ -241,9 +271,8 @@ class MemoryStore:
-                     pass
-             fd.close()
++        if memory_namespace:
++            from tools import memory_tool
++            memory_tool.get_memory_dir(memory_namespace)  # reject an unsafe namespace before any I/O
+         self.memory_entries: list[str] = []
+         self.user_entries: list[str] = []
+         self.memory_char_limit, self.user_char_limit = memory_char_limit, user_char_limit
+@@ -295,10 +300,12 @@ class MemoryStore:
+                 with suppress(OSError):
+                     _flock(True)
  
 -    @staticmethod
 -    def _path_for(target: str) -> Path:
--        mem_dir = get_memory_dir()
 +    def _path_for(self, target: str) -> Path:
-+        mem_dir = self._memory_dir
-         if target == "user":
-             return mem_dir / "USER.md"
-         return mem_dir / "MEMORY.md"
-@@ -272,7 +301,7 @@ class MemoryStore:
+         from tools import memory_tool  # get_memory_dir is monkeypatched there
+-        return memory_tool.get_memory_dir() / ("USER.md" if target == "user" else "MEMORY.md")
++        # The zero-argument call stays for unscoped stores: integrations replace get_memory_dir
++        # with a zero-argument resolver.
++        base = memory_tool.get_memory_dir(self.memory_namespace) if self.memory_namespace else memory_tool.get_memory_dir()
++        return base / ("USER.md" if target == "user" else "MEMORY.md")
  
-     def save_to_disk(self, target: str):
-         """Persist entries to the appropriate file. Called after every mutation."""
--        get_memory_dir().mkdir(parents=True, exist_ok=True)
-+        self._memory_dir.mkdir(parents=True, exist_ok=True)
-         self._write_file(self._path_for(target), self._entries_for(target))
- 
-     def _entries_for(self, target: str) -> List[str]:
-@@ -1088,6 +1117,3 @@ registry.register(
-     emoji="🧠",
- )
- 
--
--
--
+     def _entries_for(self, target: str) -> list[str]:
+         return self.user_entries if target == "user" else self.memory_entries
