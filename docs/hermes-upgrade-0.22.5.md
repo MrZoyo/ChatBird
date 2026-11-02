@@ -134,7 +134,7 @@ git clone https://github.com/NousResearch/hermes-agent.git /tmp/hermes-release
 git -C /tmp/hermes-release checkout --detach bf0203a794a07aac3ff764972ab9087baa4e4f4e
 scripts/apply-hermes-patches.sh /tmp/hermes-release --check
 scripts/apply-hermes-patches.sh /tmp/hermes-release
-scripts/build-hermes-release.sh /tmp/hermes-release /tmp/hermes-0.22.5.tar.gz
+PYTHON=.venv/bin/python scripts/build-hermes-release.sh /tmp/hermes-release /tmp/hermes-0.22.5.tar.gz
 shasum -a 256 /tmp/hermes-0.22.5.tar.gz
 ```
 
@@ -279,12 +279,25 @@ Discord 验收（2026-11-02 用户操作，全部通过）：
 观察到 2026-11-09 再删旧目录和备份。期间关注 RSS、`journalctl` 的 `Hook .* timed out`、`/root/.hermes/cache/web` 的大小。
 新版本把被截断网页的全文存到 `cache/web`，这是新增的磁盘占用。
 
-### 已知问题：版本显示 `vunknown`
+### 版本戳（2026-11-02 已上线）
 
-Hermes 从 `install-stamp.json` 或 Git 读版本，发布包两者都没有，所以 `/version` 显示 `vunknown`，User-Agent 是 `HermesAgent/unknown`。只影响显示。用户决定下次重启网关时一起修，所以下次计划重启前先做这一项。
+Hermes 从 `install-stamp.json` 或 Git 读版本，最初的发布包两者都没有，所以 `/version` 显示 `vunknown`。现在 `build-hermes-release.sh` 用 `hermes-stack.lock` 里的 `base_commit` 和 `base_version` 调用上游的 `scripts/write_install_stamp.py`，`--update-mechanism external`。
+这个脚本要 Python 3.11 以上，所以构建时传 `PYTHON=.venv/bin/python`。**下次换基线时要同时改 `base_version`。**
 
-修法：`build-hermes-release.sh` 调用上游的 `scripts/write_install_stamp.py`，传 `--base-version`、`--commit` 和 `--update-mechanism external`。网关启动时才读版本，所以要到下次重启才生效。
-`boot_bootstrap`、`source_check`、`venv_sync` 也读这个文件，改之前先在本地发布包上验证启动和这些路径，不要直接写到生产目录。
+**版本戳不只影响显示。** 带 commit 的版本戳让 `current_install_identity` 不再是空值，网关（和任何 `hermes` 命令）启动时会按 commit 跑一次此前从未跑过的 `BOOT_HOME_STEPS`，记录写在
+`/root/.hermes/installs/<sha16>/bootstrap/default.json`。在 v0.22.5 生产环境上逐项结果是：
+
+| 步骤 | 结果 |
+|---|---|
+| `adopt_blessed_checkout` | 跳过，不是 Git 工作树 |
+| `migrate_config` | 跳过，`below-support-floor`，只记一条警告。生产配置没有 `_config_version`，按版本 0 算 |
+| `state_db_guard` | 只读检查，通过 |
+| `drop_live_plugin_catalog` | 缓存本来就不存在 |
+| `expose_cli` | 跳过，不碰 `/usr/local/bin/hermes` |
+
+**换基线时重点复查 `migrate_config`。** 如果给配置加上 `_config_version`，或者上游改了支持下限，这一步会在网关启动时真的重写 `config.yaml`。所以新基线要先在配置副本上跑一次 `step_migrate_config`，确认没有改动再上线。
+
+有版本戳后 `_is_sealed` 为真，`hermes update` 和 `update --check` 仍以 “Not a git repository” 拒绝。`dirty: true` 是如实记录（发布包打过补丁），运行时只有 `.git` 目录下的更新流程读它。
 
 ## 回滚方案
 
@@ -302,6 +315,7 @@ systemctl start hermes-gateway.service
 - **`state.db`：** 默认保留。本地测试里 v0.17 代码能读写 schema 32 的库。只有旧代码报错时才恢复：停服务，把备份里的 `state.db*` 复制回去，
   再启动。这样会丢掉升级后的对话记录。
 - **Skill：** 新版本启动时同步内置 Skill。公开审批按内容哈希绑定，不受影响。需要时从备份恢复 `skills/`。
+- **systemd 沙箱：** 旧版本没有在 `chatbird-sandbox.conf` 下跑过。回滚时先删掉它，确认旧版本正常后再决定是否加回。
 
 回滚后同样检查服务状态和短日志。
 

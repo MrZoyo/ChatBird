@@ -133,6 +133,11 @@ wildcard, or disable `chatbird-policy`. It also requires the safety settings in
 anonymous web tiers being off, and checks that `.env` has the administrator mapping
 and no `HERMES_MEDIA_*` line.
 
+Also consider installing `chatbird-sandbox.conf` in the same drop-in directory. It
+makes system directories read-only for the gateway, gives it a private `/tmp`, and
+caps its memory; adjust `MemoryMax` to the host. While the gateway runs as root,
+this guards against accidents and runaway memory, and is not a security boundary.
+
 All IDs and credentials in the examples are placeholders. Keep real secrets in
 the deployment environment and never commit them.
 

@@ -2,6 +2,7 @@
 # Keep this file free of credentials; it is safe to commit.
 upstream_repo https://github.com/NousResearch/hermes-agent.git
 base_commit bf0203a794a07aac3ff764972ab9087baa4e4f4e
+base_version 0.22.5
 patch patches/hermes-discord-guild-memory-isolation.patch
 patch patches/hermes-discord-public-access-dm-log.patch
 patch patches/hermes-chatbird-home-notice.patch

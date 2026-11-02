@@ -124,6 +124,10 @@ systemctl daemon-reload
 文件发送严格模式、匿名网页回退关闭等安全设置保持不变，并检查 `.env` 含有管理员映射、
 不含 `HERMES_MEDIA_*`。
 
+还建议安装 `chatbird-sandbox.conf`，同样放到这个 drop-in 目录。它让系统目录对网关只读、
+使用私有 `/tmp`，并限制内存；`MemoryMax` 按主机内存调整。网关以 root 运行时，它只能防误操作和
+内存失控，不是安全边界。
+
 示例中的 ID 和凭据均为占位内容。真实密钥只应保存在部署环境中，不得提交到 Git。
 
 ### 4. 配置 Discord 应用

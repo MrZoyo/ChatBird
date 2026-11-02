@@ -20,10 +20,53 @@
 | 模型 | Anthropic Claude Sonnet 5.5 `claude-sonnet-5-5`（主模型、文本辅助任务和图片分析） |
 | 备用模型 | Xiaomi `mimo-v2.6-flash`（主模型调用失败时切换；图片分析不跟随） |
 | 策略插件 | `chatbird-policy` `1.6.0` |
+| systemd 沙箱 | drop-in `chatbird-sandbox.conf`：系统目录只读、私有 `/tmp`、内存上限 1200M |
 
 生产机只有约 1.6 GiB 内存。只能做定向读取、单文件测试和短日志检查；不要在生产机运行全仓扫描、完整测试套件、高并发构建或无必要升级。不要打印、复制到日志或提交 `/root/.hermes/.env` 的实际值。
 
 本地非敏感配置镜像是 [`../patches/chatbird-production-config.yaml`](../patches/chatbird-production-config.yaml)，环境变量格式参考 [`../.env.example`](../.env.example)。
+
+### 2026-11-02 systemd 沙箱和版本戳
+
+用户决定不等观察期结束，16:24 CET 上线，由 Fable subagent 只读审查。drop-in 是 `chatbird-sandbox.conf`，模板在 `deploy/systemd/hermes-gateway.service.d/`：
+
+```ini
+[Service]
+ProtectSystem=full
+PrivateTmp=yes
+MemoryMax=1200M
+MemorySwapMax=256M
+OOMPolicy=continue
+```
+
+- `/usr`、`/etc`、`/boot` 对网关和它的子进程只读，包括管理员频道里的终端命令。要改系统文件走 SSH。
+- `/tmp` 是网关私有的，SSH 里看不到。Hermes 的 `TMPDIR` 和媒体文件都在 `/root/.hermes` 下，不受影响。
+- `OOMPolicy=continue` 是审查加的：默认的 `stop` 下，内核杀掉一个 Chromium 子进程就会停掉整个网关。实测（`MemoryMax=150M`）默认值下单元退出，`continue` 下主进程存活。
+  `MemorySwapMax=256M` 防止超限时占满 2 GiB swap 把整机拖慢。
+
+**这不是安全边界。** 网关仍是 root，能读 `/root/.hermes` 里的 Key，也还有 `CAP_SYS_ADMIN`，可以重新挂载。它防的是误操作和内存失控。
+
+版本戳 `/usr/local/lib/hermes-agent-0.22.5/install-stamp.json` 让 `hermes --version` 显示 `Hermes Agent v0.22.5 (2026.9.24) · upstream bf0203a7`。只放了这一个文件，发布包没有重建，`CHATBIRD_RELEASE` 仍是 `5e00a46`。
+它不只影响显示，有副作用，见[升级文档](hermes-upgrade-0.22.5.md)的“版本戳”。
+
+验证结果：
+
+- 重启前：临时 systemd 单元用相同设置跑在代码副本和临时 `HERMES_HOME` 上。系统目录写入被拒，`/root/.hermes` 可写。维护流程没有改动配置，`hermes update` 拒绝。
+  本地 Chromium 读到 example.com（917 字符）和维基百科（79,238 字符），进程已清理，单元内存峰值约 800 MiB（含探针和页缓存，不含网关），没有用 swap。
+- 第一次重启：Discord 断开约 11 秒。维护流程跑了一次，配置 SHA 不变，`/usr/local/bin/hermes` 不变。`errors.log` 多一条预期内的 `config migration skipped`。
+- 第二次重启：9 秒连上，维护流程没有再跑，没有新警告，`NRestarts=0`，journal 0 条错误，最终 PID `784589`。
+
+未验证：Discord 里的 `/version` 显示；运行中的网关实际触发 Chromium 回退（只在相同设置的临时单元里测过）；1200M 限额下真实超限（只用小限额测过）。
+网关加一个重页面后余量不大，观察 `/sys/fs/cgroup/system.slice/hermes-gateway.service/memory.events` 的 `oom_kill`。
+
+回滚（两项可以分开做）：
+
+```bash
+rm /etc/systemd/system/hermes-gateway.service.d/chatbird-sandbox.conf
+rm /usr/local/lib/hermes-agent-0.22.5/install-stamp.json
+systemctl daemon-reload
+systemctl restart hermes-gateway.service
+```
 
 ### 2026-11-02 Hermes 升级到 v0.22.5
 
@@ -76,8 +119,7 @@ Discord 验收：用户当天按升级文档的 7 项清单操作，全部通过
 
 未验证：真实额度耗尽时的错误文本。
 
-已知问题：`hermes --version` 和 Discord `/version` 显示 `vunknown`，模型请求的 User-Agent 是 `HermesAgent/unknown`。发布包没有 `install-stamp.json`，也不是 Git 工作树，Hermes 读不到版本。实际版本看 `CHATBIRD_RELEASE`。
-目前没有插件声明 `requires_hermes`，模型请求也正常，所以只影响显示。用户决定下次重启网关时一起修，修法见升级文档。
+升级后 `/version` 显示 `vunknown` 的问题已在同日修复，见上一节。
 
 部署前备份（仅生产机，目录权限 `0700`）：
 `/root/.hermes/backups/hermes-0.22.5-20261102T112302Z/`，含 `state.db`（schema 16）、`.env`、`auth.json`、配置、插件 1.5.0、校验脚本、记忆、会话和 Skill。
@@ -641,6 +683,7 @@ systemctl show hermes-gateway.service -p MainPID -p NRestarts -p MemoryCurrent
 journalctl -u hermes-gateway.service --since "10 minutes ago" --no-pager -n 100
 cat /usr/local/lib/hermes-agent-0.22.5/CHATBIRD_RELEASE
 cat /etc/systemd/system/hermes-gateway.service.d/release.conf
+cat /etc/systemd/system/hermes-gateway.service.d/chatbird-sandbox.conf
 ```
 
 部署或升级时：

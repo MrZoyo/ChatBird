@@ -16,6 +16,11 @@ repo_root=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 lock_file="$repo_root/hermes-stack.lock"
 
 base_commit=$(awk '$1 == "base_commit" { print $2; exit }' "$lock_file")
+base_version=$(awk '$1 == "base_version" { print $2; exit }' "$lock_file")
+if [[ -z $base_version ]]; then
+    echo "Missing base_version in $lock_file" >&2
+    exit 1
+fi
 if [[ $(git -C "$checkout" rev-parse HEAD) != "$base_commit" ]]; then
     echo "Checkout is not at the locked base $base_commit" >&2
     exit 1
@@ -43,13 +48,23 @@ trap 'rm -f "$file_list"' EXIT
     { print }
 ' > "$file_list"
 
-trap 'rm -f "$file_list" "$checkout/CHATBIRD_RELEASE"' EXIT
+trap 'rm -f "$file_list" "$checkout/CHATBIRD_RELEASE" "$checkout/install-stamp.json"' EXIT
 {
     echo "hermes_base $base_commit"
     echo "chatbird_commit $(git -C "$repo_root" rev-parse HEAD)"
     echo "built_at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } > "$checkout/CHATBIRD_RELEASE"
 echo CHATBIRD_RELEASE >> "$file_list"
+
+# The stamp is more than a version label: it makes Hermes run its boot
+# maintenance once per commit. See docs/hermes-upgrade-0.22.5.md.
+PYTHONDONTWRITEBYTECODE=1 "${PYTHON:-python3}" "$checkout/scripts/write_install_stamp.py" \
+    --output "$checkout/install-stamp.json" \
+    --base-version "$base_version" \
+    --distance 0 \
+    --commit "$base_commit" \
+    --update-mechanism external
+echo install-stamp.json >> "$file_list"
 
 # COPYFILE_DISABLE keeps macOS tar from adding AppleDouble files.
 COPYFILE_DISABLE=1 tar -czf "$output" -C "$checkout" -T "$file_list"
